@@ -1,0 +1,1898 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hyperion-ONMS • Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        body { font-family: 'Inter', system-ui, sans-serif; }
+        .font-display { font-family: 'Space Grotesk', 'Inter', sans-serif; font-weight: 600; }
+        .section-header { font-size: 0.75rem; letter-spacing: 0.5px; font-weight: 600; text-transform: uppercase; }
+        .modern-table { border-collapse: separate; border-spacing: 0; }
+        .modern-table tbody tr:hover { background-color: #1f2937; }
+        .nav-link.active { background-color: #1e40af; color: white; }
+        .view { display: none; }
+        .view.active { display: block; }
+
+        /* Alarm cards: keep compact, never overflow the container */
+        .alert-card {
+            max-height: 195px;
+            overflow-y: auto;
+            font-size: 12px;
+        }
+        .alert-card .text-xs, .alert-card .text-[10px] { line-height: 1.15; }
+        .alert-card > div { word-break: break-word; }
+    </style>
+    <script>
+        /*
+         * ============================================================
+         * Hyperion-ONMS Dashboard — Single-file SPA (Tailwind + Chart.js)
+         * ============================================================
+         *
+         * MAINTAINABILITY NOTE (June 2026 refactor):
+         * This file grew organically during rapid field development (ngrok + real ONUs).
+         * It is intentionally self-contained so it can be served with zero extra assets.
+         *
+         * What was improved for long-term maintenance:
+         *   - Prominent section headers and this maintenance block.
+         *   - Centralized Honduras (UTC-6) time offset constant.
+         *   - Clear grouping of concerns (auth, data, rendering, graphs).
+         *   - Reusable pure helpers for status badges.
+         *   - Comments around the complex graph popup generator.
+         *
+         * Future improvements (when time permits):
+         *   - Split into dashboard.html + dashboard.js + dashboard.css served statically.
+         *   - Move more presentation logic to a small modern frontend (htmx or small Vue/Svelte).
+         *
+         * Do not add large new features here without considering extraction.
+         */
+
+        // === Early safety shims (must exist before any inline onclick) ===
+        var currentView = 'alerts';
+        var currentDetailGpon = null;
+        var cachedClients = null;
+        var cachedOnts = null;
+        var cachedOlts = null;
+        var cachedAlerts = null;
+        var authToken = localStorage.getItem('hyperion_token') || null;
+        var currentUser = null;
+        var lastOltPreset = '1d';
+        var currentAlertsItems = [];
+
+        // Centralized timezone handling (Honduras CST, UTC-6, no DST).
+        // All display times are converted here so we have one place to change.
+        var HONDURAS_UTC_OFFSET_HOURS = -6;
+
+        if (typeof switchView === "undefined") {
+            window.switchView = function(view) {
+                document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+                const target = document.getElementById('view-' + view);
+                if (target) target.classList.add('active');
+                const title = document.getElementById('view-title');
+                if (title) title.textContent = {alerts:'Dashboard de Alerta', clientes:'Clientes', olts:'OLTs'}[view] || view;
+                document.querySelectorAll('.nav-link').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+                currentView = view;
+
+                if (typeof fetchAlerts === "function") {
+                    if (view === 'alerts') { fetchAlerts(); fetchOntsForClientes(); }
+                    else if (view === 'clientes') { fetchOntsForClientes(); fetchClients(); }
+                    else if (view === 'olts') fetchOltsForView();
+                }
+            };
+        }
+        if (typeof showLoginModal === "undefined") {
+            window.showLoginModal = function() {
+                const m = document.getElementById('login-modal');
+                if (m) { m.classList.remove('hidden'); m.classList.add('flex'); }
+            };
+        }
+        if (typeof logout === "undefined") {
+            window.logout = function(silent) { if (!silent) console.log("logout"); };
+        }
+        if (typeof refreshCurrentView === "undefined") {
+            window.refreshCurrentView = function() {
+                if (currentView === 'alerts') { if(typeof fetchAlerts==="function") fetchAlerts(); }
+                else if (currentView === 'clientes') { if(typeof fetchOntsForClientes==="function") fetchOntsForClientes(true); if(typeof fetchClients==="function") fetchClients(true); }
+                else if (currentView === 'olts') { if(typeof fetchOltsForView==="function") fetchOltsForView(); }
+            };
+        }
+        if (typeof fetchOntsForClientes === "undefined") {
+            window.fetchOntsForClientes = function(force) {
+                // Will be overridden by the full implementation in the main script once it loads.
+                // If this runs, it means main script didn't load; basic stub.
+                console.warn('fetchOntsForClientes stub called; main script may have failed to load');
+            };
+        }
+        if (typeof showOntDetail === "undefined") {
+            window.showOntDetail = function(gpon_sn) {
+                console.warn('showOntDetail stub; main script may have failed');
+            };
+        }
+        if (typeof refreshCurrentDetail === "undefined") {
+            window.refreshCurrentDetail = function() {};
+        }
+        if (typeof pingCurrentDetailOnt === "undefined") {
+            window.pingCurrentDetailOnt = function() {};
+        }
+        if (typeof generateGraphForOlt === "undefined") {
+            window.generateGraphForOlt = function(oltId) {
+                console.warn("generateGraphForOlt not yet loaded from main script (hard refresh if needed)");
+            };
+        }
+        if (typeof generateGraphForCurrentDetailPreset === "undefined") {
+            window.generateGraphForCurrentDetailPreset = function(preset) {
+                console.warn("generateGraphForCurrentDetailPreset not yet loaded from main script (hard refresh if needed)");
+            };
+        }
+        if (typeof generateGraphForCurrentDetail === "undefined") {
+            window.generateGraphForCurrentDetail = function(from, to) {
+                console.warn("generateGraphForCurrentDetail not yet loaded");
+            };
+        }
+    </script>
+</head>
+<body class="bg-slate-950 text-slate-200">
+    <div class="flex h-screen">
+        <!-- Sidebar -->
+        <div class="w-64 bg-slate-900 border-r border-slate-800 flex flex-col">
+            <div class="p-4 border-b border-slate-800 flex items-center gap-x-3">
+                <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center">
+                    <i class="fa-solid fa-satellite text-white"></i>
+                </div>
+                <div>
+                    <span class="font-display text-xl font-semibold tracking-tighter">Hyperion</span>
+                    <span class="font-display text-xl font-semibold tracking-tighter text-blue-400">-ONMS</span>
+                </div>
+            </div>
+            <nav class="flex-1 p-3 text-sm">
+                <button onclick="switchView('alerts')" class="nav-link w-full text-left flex items-center gap-x-3 px-3 py-2.5 rounded-xl mb-1 hover:bg-slate-800 active" data-view="alerts">
+                    <i class="fa-solid fa-exclamation-triangle w-5 text-amber-400"></i> <span>Dashboard de Alerta</span>
+                </button>
+                <button onclick="switchView('clientes')" class="nav-link w-full text-left flex items-center gap-x-3 px-3 py-2.5 rounded-xl mb-1 hover:bg-slate-800" data-view="clientes">
+                    <i class="fa-solid fa-users w-5 text-emerald-400"></i> <span>Clientes</span>
+                </button>
+                <button onclick="switchView('olts')" class="nav-link w-full text-left flex items-center gap-x-3 px-3 py-2.5 rounded-xl mb-1 hover:bg-slate-800" data-view="olts">
+                    <i class="fa-solid fa-network-wired w-5 text-blue-400"></i> <span>OLTs</span>
+                </button>
+            </nav>
+            <div class="p-3 border-t border-slate-800 text-xs">
+                <div id="user-area" onclick="showLoginModal()" class="flex items-center gap-x-2 cursor-pointer mb-2">
+                    <div class="w-6 h-6 bg-slate-700 rounded-full flex items-center justify-center"><i class="fa-solid fa-user text-xs"></i></div>
+                    <div>
+                        <div id="user-name" class="text-xs font-medium">Invitado</div>
+                        <div id="user-role" class="text-[10px] text-slate-500">Sin sesión</div>
+                    </div>
+                </div>
+                <button onclick="logout()" class="text-slate-400 hover:text-white text-xs flex items-center gap-x-1"><i class="fa-solid fa-sign-out-alt"></i> Salir</button>
+            </div>
+        </div>
+
+        <!-- Main -->
+        <div class="flex-1 flex flex-col overflow-hidden">
+            <!-- Top -->
+            <div class="px-6 py-3 border-b border-slate-800 bg-slate-900 flex items-center justify-between flex-shrink-0">
+                <div class="flex items-center gap-x-3">
+                    <span id="view-title" class="text-xl font-semibold">Alertas</span>
+                    <span class="text-[10px] px-2 py-0.5 bg-slate-800 text-blue-400 rounded font-mono">v0.2 • dev</span>
+                </div>
+                <div class="flex items-center gap-x-3 text-xs">
+                    <div class="flex items-center gap-x-1.5 px-3 py-1 bg-slate-800 border border-slate-700 rounded-full">
+                        <div class="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
+                        <span id="live-clock" class="font-mono text-slate-400"></span>
+                    </div>
+                    <button onclick="refreshCurrentView()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg flex items-center gap-x-2">
+                        <i class="fa-solid fa-sync"></i> Refrescar
+                    </button>
+                </div>
+            </div>
+
+            <!-- Content -->
+            <div class="flex-1 overflow-auto p-6">
+                <!-- ALERTAS VIEW (ONLY ALERTS - no client cards) -->
+                <div id="view-alerts" class="view active">
+                    <div class="flex items-center justify-between mb-3">
+                        <div class="flex items-center gap-x-2">
+                            <i class="fa-solid fa-exclamation-triangle text-amber-400"></i>
+                            <span class="section-header text-amber-400">Alertas Activas</span>
+                        </div>
+                        <div id="alerts-count" class="text-xs px-3 py-1 bg-amber-900/30 text-amber-400 rounded-full font-mono"></div>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-3" id="alerts-grid">
+                        <div class="col-span-3 text-center py-8 text-slate-500 bg-slate-900 border border-slate-800 rounded-3xl">Cargando alertas...</div>
+                    </div>
+
+                    <!-- Recent ONTs from probe data, so user sees gpon/mac/wan updates immediately in main alerts dashboard -->
+                    <div class="mt-4">
+                        <span class="section-header text-blue-400">Recent ONT/ONU from probes (gpon id, mac, wan ip, last seen)</span>
+                        <div id="recent-onts-alerts" class="bg-slate-900 border border-slate-800 rounded p-2 text-xs font-mono mt-1"></div>
+                    </div>
+                </div>
+
+                <!-- CLIENTES VIEW -->
+                <div id="view-clientes" class="view">
+                    <div class="flex justify-between items-center mb-4">
+                        <span class="text-xl font-semibold">Clientes</span>
+                        <button onclick="showCreateClientModal()" class="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-500 rounded-lg flex items-center gap-x-2">
+                            <i class="fa-solid fa-plus"></i> Nuevo Cliente
+                        </button>
+                    </div>
+
+                    <div class="mb-3 max-w-sm">
+                        <input id="client-search" onkeyup="filterClientsTable()" type="text" placeholder="Buscar..." class="w-full bg-slate-900 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                    </div>
+
+                    <div class="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden mb-6">
+                        <table class="w-full text-sm modern-table">
+                            <thead><tr class="bg-slate-950 text-slate-400 text-xs">
+                                <th class="px-6 py-3 text-left">Cliente</th>
+                                <th class="px-4 py-3 text-left">GPON</th>
+                                <th class="px-4 py-3 text-left">IP</th>
+                                <th class="px-4 py-3 text-center">Último</th>
+                                <th class="px-4 py-3"></th>
+                            </tr></thead>
+                            <tbody id="clients-tbody" class="divide-y divide-slate-800"></tbody>
+                        </table>
+                    </div>
+
+                    <!-- Date range for graphs (opens in NEW TAB) - global. For specific client use "mas detalle" on ONT row (has its own range+generate) -->
+                    <div class="bg-slate-900 border border-slate-800 rounded-3xl p-5 max-w-lg">
+                        <div class="font-semibold mb-3">Gráficas globales (solo DNS + tiempo por servicio)</div>
+                        <div class="flex flex-wrap gap-2 mb-3">
+                            <button onclick="generateOptimizedDashboardClientesPreset('1h')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded-xl text-xs flex items-center gap-x-1"><i class="fa-solid fa-clock"></i> Hace 1 hora</button>
+                            <button onclick="generateOptimizedDashboardClientesPreset('1d')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded-xl text-xs flex items-center gap-x-1"><i class="fa-solid fa-calendar-day"></i> Último 1 día</button>
+                            <button onclick="generateOptimizedDashboardClientesPreset('1w')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded-xl text-xs flex items-center gap-x-1"><i class="fa-solid fa-calendar-week"></i> Última 1 semana</button>
+                            <button onclick="generateOptimizedDashboardClientesPreset('1m')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded-xl text-xs flex items-center gap-x-1"><i class="fa-solid fa-calendar-alt"></i> Último 1 mes</button>
+                            <button onclick="generateOptimizedDashboardClientesPreset('today')" class="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 rounded-xl text-xs flex items-center gap-x-1"><i class="fa-solid fa-calendar"></i> Hoy (solo logs de hoy)</button>
+                        </div>
+                        <div class="text-[10px] text-slate-500 mt-1">Abre pestaña con pings DNS y líneas por servicio (colores distintos) de total_ms de http_tests del probe. Usa rangos predefinidos según hora del servidor. "Hoy" muestra solo los logs/incidentes del día actual.</div>
+                    </div>
+
+                    <!-- ONTs / ONUs from probes (to view/edit probe data and link) -->
+                    <div class="mt-6">
+                        <div class="flex justify-between items-center mb-2">
+                            <span class="font-semibold">ONTs / ONUs (desde probes - actualizaciones)</span>
+                            <div class="flex gap-1">
+                                <button onclick="showOntModal()" class="text-xs px-2 py-1 bg-emerald-600 hover:bg-emerald-500 rounded">Nuevo ONT</button>
+                                <button onclick="fetchOntsForClientes()" class="text-xs px-2 py-1 border border-slate-600 rounded">Refrescar</button>
+                            </div>
+                        </div>
+                        <div class="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden">
+                            <table class="w-full text-sm modern-table">
+                                <thead><tr class="bg-slate-950 text-slate-400 text-xs">
+                                    <th class="px-6 py-3 text-left">GPON / MAC</th>
+                                    <th class="px-4 py-3 text-left">IP</th>
+                                    <th class="px-4 py-3 text-center">Último</th>
+                                    <th class="px-4 py-3"></th>
+                                </tr></thead>
+                                <tbody id="onts-clientes-tbody" class="divide-y divide-slate-800"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- OLTs VIEW (with edit + ping) -->
+                <div id="view-olts" class="view">
+                    <div class="flex justify-between mb-4">
+                        <span class="text-xl font-semibold">OLTs</span>
+                        <button onclick="showCreateOLTModal()" class="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 rounded-lg flex items-center gap-x-2">
+                            <i class="fa-solid fa-plus"></i> Nueva OLT
+                        </button>
+                    </div>
+                    <div class="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden">
+                        <table class="w-full text-sm modern-table">
+                            <thead><tr class="bg-slate-950 text-slate-400 text-xs">
+                                <th class="px-6 py-3 text-left">Nombre</th>
+                                <th class="px-4 py-3 text-left">IP</th>
+                                <th class="px-4 py-3 text-left">Ubicación</th>
+                                <th class="px-4 py-3 text-center">Estado</th>
+                                <th class="px-4 py-3 text-center">Ping</th>
+                                <th class="px-4 py-3"></th>
+                            </tr></thead>
+                            <tbody id="olts-tbody" class="divide-y divide-slate-800"></tbody>
+                        </table>
+                    </div>
+
+                    <!-- Date range for OLT ping graphs (per OLT click) -->
+                    <div class="bg-slate-900 border border-slate-800 rounded-3xl p-5 max-w-lg mt-4">
+                        <div class="font-semibold mb-3">Gráficas de Ping a OLT (elige rango predefinido)</div>
+                        <div class="flex flex-wrap gap-2 mb-2">
+                            <button onclick="setOltPreset('1h')" class="px-2 py-1 bg-blue-700 hover:bg-blue-600 rounded text-[10px]">1h</button>
+                            <button onclick="setOltPreset('1d')" class="px-2 py-1 bg-blue-700 hover:bg-blue-600 rounded text-[10px]">1d</button>
+                            <button onclick="setOltPreset('1w')" class="px-2 py-1 bg-blue-700 hover:bg-blue-600 rounded text-[10px]">1s</button>
+                            <button onclick="setOltPreset('1m')" class="px-2 py-1 bg-blue-700 hover:bg-blue-600 rounded text-[10px]">1m</button>
+                            <button onclick="setOltPreset('today')" class="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 rounded text-[10px]">Hoy</button>
+                        </div>
+                        <div class="text-[10px] text-slate-500 mt-1">Click "Gráficas" en la fila de una OLT. Usa preset (por defecto 1 día). "Hoy" = solo logs del día actual. Rango según hora servidor.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Login Modal -->
+    <div id="login-modal" onclick="if (event.target.id === 'login-modal') hideLoginModal()" class="hidden fixed inset-0 bg-black/70 z-[100] flex items-center justify-center p-4">
+        <div onclick="event.stopImmediatePropagation()" class="bg-slate-900 border border-slate-700 w-full max-w-sm rounded-3xl p-6">
+            <div class="font-semibold text-xl mb-1">Acceso Técnico</div>
+            <div class="text-sm text-slate-400 mb-4">Hyperion-ONMS • Solo personal autorizado</div>
+            <div class="space-y-3">
+                <input id="login-username" value="tech" class="w-full bg-slate-950 border border-slate-700 px-4 py-2.5 rounded-2xl text-sm">
+                <input id="login-password" value="tech123" type="password" class="w-full bg-slate-950 border border-slate-700 px-4 py-2.5 rounded-2xl text-sm">
+                <button onclick="performLogin()" class="mt-2 w-full py-3 bg-blue-600 hover:bg-blue-500 text-sm font-semibold rounded-2xl">INICIAR SESIÓN</button>
+                <div class="text-[10px] text-center text-slate-500">Demo: tech / tech123</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Client Modal for Create/Edit -->
+    <div id="client-modal" onclick="if (event.target.id === 'client-modal') hideClientModal()" class="hidden fixed inset-0 bg-black/70 z-[100] flex items-center justify-center p-4">
+        <div onclick="event.stopImmediatePropagation()" class="bg-slate-900 border border-slate-700 w-full max-w-md rounded-3xl p-6">
+            <div class="font-semibold text-xl mb-4" id="client-modal-title">Cliente</div>
+            <form id="client-form" onsubmit="saveClient(event)">
+                <input type="hidden" id="client-id">
+                <div class="space-y-3">
+                    <div>
+                        <label class="text-xs text-slate-400">Nombre *</label>
+                        <input id="client-name" required class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="text-xs text-slate-400">GPON SN</label>
+                            <input id="client-gpon" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                        </div>
+                        <div>
+                            <label class="text-xs text-slate-400">MAC</label>
+                            <input id="client-mac" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="text-xs text-slate-400">Teléfono</label>
+                            <input id="client-phone" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                        </div>
+                        <div>
+                            <label class="text-xs text-slate-400">Email</label>
+                            <input id="client-email" type="email" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                        </div>
+                    </div>
+                    <div>
+                        <label class="text-xs text-slate-400">Dirección</label>
+                        <input id="client-address" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                    </div>
+                    <div>
+                        <label class="text-xs text-slate-400">OLT a la que depende (opcional)</label>
+                        <select id="client-olt" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                            <option value="">-- Ninguna / No asignar --</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="mt-6 flex gap-3">
+                    <button type="button" onclick="hideClientModal()" class="flex-1 py-2 border border-slate-600 hover:bg-slate-800 rounded-2xl text-sm">Cancelar</button>
+                    <button type="submit" class="flex-1 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-2xl text-sm font-medium">Guardar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ONT / ONU Modal for Create/Edit -->
+    <div id="ont-modal" onclick="if (event.target.id === 'ont-modal') hideOntModal()" class="hidden fixed inset-0 bg-black/70 z-[100] flex items-center justify-center p-4">
+        <div onclick="event.stopImmediatePropagation()" class="bg-slate-900 border border-slate-700 w-full max-w-md rounded-3xl p-6">
+            <div class="font-semibold text-xl mb-4" id="ont-modal-title">ONT / ONU</div>
+            <form id="ont-form" onsubmit="saveOnt(event)">
+                <input type="hidden" id="ont-id">
+                <div class="space-y-3">
+                    <div>
+                        <label class="text-xs text-slate-400">GPON SN *</label>
+                        <input id="ont-gpon" required class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="text-xs text-slate-400">MAC</label>
+                            <input id="ont-mac" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                        </div>
+                        <div>
+                            <label class="text-xs text-slate-400">IP</label>
+                            <input id="ont-ip" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="text-xs text-slate-400">Modelo</label>
+                            <input id="ont-model" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                        </div>
+                        <div>
+                            <label class="text-xs text-slate-400">Ubicación</label>
+                            <input id="ont-location" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                        </div>
+                    </div>
+                    <div>
+                        <label class="text-xs text-slate-400">Notas</label>
+                        <input id="ont-notes" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="text-xs text-slate-400">Customer ID (opcional)</label>
+                            <input id="ont-customer" type="number" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm" placeholder="ID del cliente">
+                        </div>
+                        <div>
+                            <label class="text-xs text-slate-400">OLT ID (opcional)</label>
+                            <input id="ont-olt" type="number" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm" placeholder="ID de la OLT">
+                        </div>
+                    </div>
+                </div>
+                <div class="mt-6 flex gap-3">
+                    <button type="button" onclick="hideOntModal()" class="flex-1 py-2 border border-slate-600 hover:bg-slate-800 rounded-2xl text-sm">Cancelar</button>
+                    <button type="submit" class="flex-1 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-2xl text-sm font-medium">Guardar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- OLT Modal for Create/Edit -->
+    <div id="olt-modal" onclick="if (event.target.id === 'olt-modal') hideOltModal()" class="hidden fixed inset-0 bg-black/70 z-[100] flex items-center justify-center p-4">
+        <div onclick="event.stopImmediatePropagation()" class="bg-slate-900 border border-slate-700 w-full max-w-md rounded-3xl p-6">
+            <div class="font-semibold text-xl mb-4" id="olt-modal-title">OLT</div>
+            <form id="olt-form" onsubmit="saveOlt(event)">
+                <input type="hidden" id="olt-id">
+                <div class="space-y-3">
+                    <div>
+                        <label class="text-xs text-slate-400">Nombre *</label>
+                        <input id="olt-name" required class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                    </div>
+                    <div>
+                        <label class="text-xs text-slate-400">IP Address *</label>
+                        <input id="olt-ip" required class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm" placeholder="192.168.1.1">
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="text-xs text-slate-400">Ubicación</label>
+                            <input id="olt-location" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                        </div>
+                        <div>
+                            <label class="text-xs text-slate-400">Modelo</label>
+                            <input id="olt-model" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                        </div>
+                    </div>
+                    <div>
+                        <label class="text-xs text-slate-400">Firmware</label>
+                        <input id="olt-firmware" class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-2xl text-sm">
+                    </div>
+                </div>
+                <div class="mt-6 flex gap-3">
+                    <button type="button" onclick="hideOltModal()" class="flex-1 py-2 border border-slate-600 hover:bg-slate-800 rounded-2xl text-sm">Cancelar</button>
+                    <button type="submit" class="flex-1 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-2xl text-sm font-medium">Guardar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ONT / Client Detail Modal: rich stats + generate graph INSIDE "mas detalle" as requested -->
+    <div id="ont-detail-modal" onclick="if (event.target.id === 'ont-detail-modal') hideOntDetail()" class="hidden fixed inset-0 bg-black/70 z-[110] flex items-center justify-center p-4">
+        <div onclick="event.stopImmediatePropagation()" class="bg-slate-900 border border-slate-700 w-full max-w-3xl rounded-3xl p-6 max-h-[92vh] overflow-auto">
+            <div class="flex items-start justify-between mb-4">
+                <div>
+                    <div class="font-semibold text-xl flex items-center gap-x-2">
+                        <i class="fa-solid fa-satellite text-blue-400"></i>
+                        <span id="detail-gpon">GPON</span>
+                    </div>
+                    <div id="detail-meta" class="text-xs text-slate-400 font-mono mt-0.5"></div>
+                </div>
+                <div class="text-right">
+                    <button onclick="hideOntDetail()" class="text-slate-400 hover:text-white text-xl leading-none">&times;</button>
+                </div>
+            </div>
+
+            <!-- Classification + reason -->
+            <div class="mb-4 flex items-center gap-x-3">
+                <div id="detail-class-badge" class="px-3 py-1 rounded-full text-sm font-semibold"></div>
+                <div id="detail-reason" class="text-sm text-slate-300 flex-1"></div>
+            </div>
+
+            <!-- Basic statistics extracted from latest probe event -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5">
+                <div class="bg-slate-950 border border-slate-800 rounded-2xl p-4">
+                    <div class="section-header text-emerald-400 mb-2">Pings DNS (última lectura)</div>
+                    <div class="space-y-1 text-sm">
+                        <div>8.8.8.8: <span id="detail-ping8" class="font-mono font-medium">—</span> <span id="detail-ping8-loss" class="text-xs text-slate-500"></span></div>
+                        <div>1.1.1.1: <span id="detail-ping1" class="font-mono font-medium">—</span> <span id="detail-ping1-loss" class="text-xs text-slate-500"></span></div>
+                    </div>
+                </div>
+                <div class="bg-slate-950 border border-slate-800 rounded-2xl p-4">
+                    <div class="section-header text-violet-400 mb-2">Tiempos de conexión servicios (http_tests)</div>
+                    <div id="detail-services" class="text-sm font-mono space-y-0.5 max-h-24 overflow-auto"></div>
+                    <div class="text-[10px] text-slate-500 mt-1">Promedio total_ms de las pruebas a servicios.</div>
+                </div>
+            </div>
+
+            <div class="mb-4 bg-slate-950 border border-slate-800 rounded-2xl p-3 text-xs">
+                <div id="detail-obs" class="text-amber-300"></div>
+                <div class="mt-1 text-slate-400">TCP retransmisiones: <span id="detail-retrans" class="font-mono">—</span>. Si servicios OK → clasificado GOOD con observación.</div>
+                <div class="mt-0.5 text-[10px] text-amber-400">El UPTIME siempre se muestra (arriba) para evitar falsas alertas en ONUs recién encendidas.</div>
+            </div>
+
+            <div class="mb-4 bg-slate-950 border border-slate-800 rounded-2xl p-3 text-xs">
+                <div class="section-header text-blue-400 mb-1">Conntrack / Sesiones NAT (última lectura del probe)</div>
+                <div class="mt-3">
+                    <div class="text-[10px] font-semibold text-blue-400 mb-1">Conntrack / Sesiones NAT (última lectura del probe)</div>
+                    <div class="grid grid-cols-2 gap-x-3 text-[10px] font-mono">
+                        <div>Total: <span id="detail-nf-count" class="font-medium">—</span> / <span id="detail-nf-max" class="font-medium">—</span> (<span id="detail-nf-pct" class="font-medium">—</span>%)</div>
+                        <div>TCP: <span id="detail-nf-tcp" class="font-medium">—</span> UDP: <span id="detail-nf-udp" class="font-medium">—</span> ICMP: <span id="detail-nf-icmp" class="font-medium">—</span></div>
+                        <div>UNREPLIED: <span id="detail-nf-unreplied" class="font-medium">—</span></div>
+                        <div>SYN_SENT: <span id="detail-nf-syn" class="font-medium">—</span></div>
+                        <div class="col-span-2">Top LAN: <span id="detail-nf-top-ip" class="font-medium">—</span> (<span id="detail-nf-top-sess" class="font-medium">—</span> sess) TCP:<span id="detail-nf-top-tcp" class="font-medium">—</span> UNR:<span id="detail-nf-top-unr" class="font-medium">—</span> SYN:<span id="detail-nf-top-syn" class="font-medium">—</span></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="text-xs text-slate-400 mb-3">Datos del probe: wan_ip, model, last_seen actualizados en cada POST /ont-monitor. Nuevas métricas conntrack desde v Conntrack Analytics.</div>
+
+            <!-- Generar grafica DENTRO del detalle del cliente/ONT -->
+            <div class="bg-slate-950 border border-slate-700 rounded-3xl p-4">
+                <div class="font-semibold mb-2 flex items-center gap-x-2 text-sm">
+                    <i class="fa-solid fa-chart-line"></i> Generar gráficas (solo DNS + tiempo por servicio) para este ONT
+                </div>
+                <div class="flex flex-wrap gap-1 mb-2">
+                    <button onclick="generateGraphForCurrentDetailPreset('1h')" class="px-2 py-1 bg-violet-700 hover:bg-violet-600 rounded text-[10px]">1h</button>
+                    <button onclick="generateGraphForCurrentDetailPreset('1d')" class="px-2 py-1 bg-violet-700 hover:bg-violet-600 rounded text-[10px]">1d</button>
+                    <button onclick="generateGraphForCurrentDetailPreset('1w')" class="px-2 py-1 bg-violet-700 hover:bg-violet-600 rounded text-[10px]">1s</button>
+                    <button onclick="generateGraphForCurrentDetailPreset('1m')" class="px-2 py-1 bg-violet-700 hover:bg-violet-600 rounded text-[10px]">1m</button>
+                    <button onclick="generateGraphForCurrentDetailPreset('today')" class="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 rounded text-[10px]">Hoy</button>
+                </div>
+                <button onclick="generateGraphForCurrentDetailPreset('1d')" class="w-full py-2.5 bg-violet-600 hover:bg-violet-500 rounded-2xl font-medium text-sm flex items-center justify-center gap-x-2">
+                    <i class="fa-solid fa-external-link-alt"></i> ABRIR GRÁFICAS EN NUEVA PESTAÑA (1 día por defecto)
+                </button>
+                <div class="text-[10px] text-slate-500 mt-1">Abre pestaña optimizada con Chart.js limpio. No incluye TCP retrans en las gráficas.</div>
+            </div>
+
+            <div class="mt-4 flex gap-2">
+                <button onclick="pingCurrentDetailOnt()" class="flex-1 py-2 text-xs border border-slate-600 hover:bg-slate-800 rounded-2xl">Ping IP del ONT</button>
+                <button onclick="refreshCurrentDetail()" class="flex-1 py-2 text-xs border border-slate-600 hover:bg-slate-800 rounded-2xl">Refrescar datos</button>
+                <button onclick="hideOntDetail()" class="flex-1 py-2 text-xs bg-slate-700 hover:bg-slate-600 rounded-2xl">Cerrar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Alerts Detail Modal / Tarjeta para ver problemas completos sin amontonar -->
+    <div id="alerts-detail-modal" onclick="if (event.target.id === 'alerts-detail-modal') hideAlertsDetail()" class="hidden fixed inset-0 bg-black/70 z-[120] flex items-center justify-center p-4">
+        <div onclick="event.stopImmediatePropagation()" class="bg-slate-900 border border-slate-700 w-full max-w-2xl rounded-3xl p-6 max-h-[85vh] overflow-auto">
+            <div class="flex items-center justify-between mb-4">
+                <div id="alerts-detail-title" class="font-semibold text-xl"></div>
+                <button onclick="hideAlertsDetail()" class="text-slate-400 hover:text-white text-2xl leading-none">&times;</button>
+            </div>
+            <div id="alerts-detail-body" class="space-y-2 text-sm max-h-[60vh] overflow-auto"></div>
+            <div class="mt-4 text-[10px] text-slate-500">Mostrando hasta los primeros 10 incidentes recientes (30min). Para más historial usa la sección de ONTs o genera gráficas con rango.</div>
+            <div class="mt-4 flex justify-end">
+                <button onclick="hideAlertsDetail()" class="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-2xl text-sm">Cerrar</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function initTailwind() { /* CDN already loaded in head */ }
+
+        function computeRange(preset) {
+            const now = new Date();
+            let ms;
+            if (preset === '1h') ms = 3600000;
+            else if (preset === '1d') ms = 24 * 3600000;
+            else if (preset === '1w') ms = 7 * 24 * 3600000;
+            else if (preset === '1m') ms = 30 * 24 * 3600000;
+            else if (preset === 'today') {
+                const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+                const from = startOfDay;
+                return {
+                    from: from.toISOString().slice(0, 16),
+                    to: now.toISOString().slice(0, 16)
+                };
+            }
+            else ms = 24 * 3600000;
+            const from = new Date(now.getTime() - ms);
+            return {
+                from: from.toISOString().slice(0, 16),
+                to: now.toISOString().slice(0, 16)
+            };
+        }
+
+        lastOltPreset = '1d';
+        function setOltPreset(preset) {
+            lastOltPreset = preset;
+            // optional: showToast('Preset OLT: ' + preset);
+        }
+
+        // Note: authToken, currentUser, currentView, cached* are also declared as var in head shims script for early access.
+        // These lets provide the main script scope versions.
+        authToken = localStorage.getItem('hyperion_token') || null;
+        currentUser = null;
+        currentView = 'alerts';
+
+        // Simple cache for optimization - avoid repeated heavy fetches on view switch (esp. over ngrok)
+        cachedClients = null;
+        cachedOnts = null;
+        cachedOlts = null;
+        cachedAlerts = null;
+
+        // currentDetailGpon and latestByGpon are declared as var in the head <script> for early global access.
+        // Use assignment here to avoid redeclaration error across script tags.
+        currentDetailGpon = null; // for the "mas detalle" modal + its generate graph
+        latestByGpon = {}; // gpon_sn -> latest telemetry event for status badges (optimized, no per-row queries)
+
+        // Convert UTC timestamp (from DB) to local display time.
+        // Uses the centralized HONDURAS_UTC_OFFSET_HOURS constant.
+        function formatTs(ts) {
+            if (!ts) return '-';
+            try {
+                var d = new Date(ts);
+                if (isNaN(d.getTime())) {
+                    return ts.replace('T', ' ').replace(/\+.*/, '').slice(0, 19);
+                }
+                // Apply Honduras offset (or any configured offset)
+                var offsetMs = HONDURAS_UTC_OFFSET_HOURS * 60 * 60 * 1000;
+                d = new Date(d.getTime() + offsetMs);
+                var y = d.getFullYear();
+                var mo = String(d.getMonth() + 1).padStart(2, '0');
+                var da = String(d.getDate()).padStart(2, '0');
+                var h = String(d.getHours()).padStart(2, '0');
+                var mi = String(d.getMinutes()).padStart(2, '0');
+                var se = String(d.getSeconds()).padStart(2, '0');
+                return y + '-' + mo + '-' + da + ' ' + h + ':' + mi + ':' + se;
+            } catch (e) {
+                return ts.replace('T', ' ').replace(/\+.*/, '').slice(0, 19);
+            }
+        }
+        function formatTime(ts) {
+            if (!ts) return '-';
+            const f = formatTs(ts);
+            return f.length >= 19 ? f.slice(11) : f;
+        }
+
+        function updateClock() {
+            const el = document.getElementById('live-clock');
+            setInterval(() => { el.textContent = new Date().toLocaleTimeString('es-ES', {hour12: false}); }, 1000);
+            el.textContent = new Date().toLocaleTimeString('es-ES', {hour12: false});
+        }
+
+        async function apiFetch(url, options = {}) {
+            const headers = options.headers || {};
+            if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+            headers['Content-Type'] = 'application/json';
+            const res = await fetch(url, { ...options, headers });
+            if (res.status === 401) { logout(true); throw new Error('Sesión expirada'); }
+            if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || 'Error API'); }
+            return res.json();
+        }
+
+        function setAuthState(user) {
+            currentUser = user;
+            document.getElementById('user-name').textContent = user.full_name || user.username || 'Técnico';
+            document.getElementById('user-role').textContent = (user.role || 'technician').toUpperCase();
+            if (authToken) localStorage.setItem('hyperion_token', authToken);
+        }
+
+        async function performLogin() {
+            const u = document.getElementById('login-username').value.trim();
+            const p = document.getElementById('login-password').value;
+            try {
+                const fd = new URLSearchParams(); fd.append('username', u); fd.append('password', p);
+                const res = await fetch('/api/v1/auth/login', { method: 'POST', body: fd });
+                if (!res.ok) throw new Error('Credenciales inválidas');
+                const data = await res.json();
+                authToken = data.access_token;
+                setAuthState(data.user);
+                hideLoginModal();
+                switchView('alerts');
+                showToast('Sesión iniciada');
+            } catch(e) { alert('Error de login: ' + e.message); }
+        }
+
+        function logout(silent=false) {
+            authToken = null; currentUser = null; localStorage.removeItem('hyperion_token');
+            document.getElementById('user-name').textContent = 'Invitado';
+            document.getElementById('user-role').textContent = 'Sin sesión';
+            if (!silent) showToast('Sesión cerrada');
+        }
+
+        function showLoginModal() {
+            const m = document.getElementById('login-modal');
+            m.classList.remove('hidden'); m.classList.add('flex');
+        }
+        function hideLoginModal() {
+            const m = document.getElementById('login-modal');
+            m.classList.add('hidden'); m.classList.remove('flex');
+        }
+
+        // ===== Client Modal =====
+        function showClientModal(data = null) {
+            const modal = document.getElementById('client-modal');
+            const form = document.getElementById('client-form');
+            const title = document.getElementById('client-modal-title');
+            form.reset();
+            document.getElementById('client-id').value = '';
+            if (data) {
+                title.textContent = 'Editar Cliente';
+                document.getElementById('client-id').value = data.id || '';
+                document.getElementById('client-name').value = data.name || '';
+                document.getElementById('client-gpon').value = data.gpon_sn || '';
+                document.getElementById('client-mac').value = data.mac_address || '';
+                document.getElementById('client-phone').value = data.phone || '';
+                document.getElementById('client-email').value = data.email || '';
+                document.getElementById('client-address').value = data.address || '';
+            } else {
+                title.textContent = 'Nuevo Cliente';
+            }
+            // Populate OLT selector (for assigning the OLT the client depends on)
+            populateClientOltSelect(data);
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        }
+
+        async function populateClientOltSelect(data = null) {
+            const sel = document.getElementById('client-olt');
+            if (!sel) return;
+            sel.innerHTML = '<option value="">-- Ninguna / No asignar --</option>';
+            try {
+                const olts = await apiFetch('/api/v1/olts/');
+                (olts || []).forEach(o => {
+                    const opt = document.createElement('option');
+                    opt.value = o.id;
+                    opt.textContent = `${o.name} (${o.ip_address})`;
+                    sel.appendChild(opt);
+                });
+                if (data && data.olt_id) {
+                    sel.value = data.olt_id;
+                } else if (data && data.onts && data.onts[0] && data.onts[0].olt_id) {
+                    sel.value = data.onts[0].olt_id;
+                }
+            } catch(e) {
+                // non fatal, select stays with default
+            }
+        }
+        function hideClientModal() {
+            const m = document.getElementById('client-modal');
+            m.classList.add('hidden'); m.classList.remove('flex');
+        }
+        async function saveClient(e) {
+            e.preventDefault();
+            const id = document.getElementById('client-id').value;
+            const payload = {
+                name: document.getElementById('client-name').value,
+                gpon_sn: document.getElementById('client-gpon').value || null,
+                mac_address: document.getElementById('client-mac').value || null,
+                phone: document.getElementById('client-phone').value || null,
+                email: document.getElementById('client-email').value || null,
+                address: document.getElementById('client-address').value || null,
+            };
+            const oltSel = document.getElementById('client-olt');
+            if (oltSel && oltSel.value) {
+                payload.olt_id = parseInt(oltSel.value, 10);
+            }
+            try {
+                if (id) {
+                    await apiFetch(`/api/v1/customers/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+                    showToast('Cliente actualizado');
+                } else {
+                    await apiFetch('/api/v1/customers/', { method: 'POST', body: JSON.stringify(payload) });
+                    showToast('Cliente creado');
+                }
+                hideClientModal();
+                fetchClients();
+                fetchOntsForClientes();
+            } catch (err) {
+                alert('Error: ' + err.message);
+            }
+        }
+
+        // ===== ONT Modal =====
+        function showOntModal(data = null) {
+            const modal = document.getElementById('ont-modal');
+            const form = document.getElementById('ont-form');
+            const title = document.getElementById('ont-modal-title');
+            form.reset();
+            document.getElementById('ont-id').value = '';
+            if (data) {
+                title.textContent = 'Editar ONT / ONU';
+                document.getElementById('ont-id').value = data.id || '';
+                document.getElementById('ont-gpon').value = data.gpon_sn || '';
+                document.getElementById('ont-mac').value = data.mac_address || '';
+                document.getElementById('ont-ip').value = data.ip_address || '';
+                document.getElementById('ont-model').value = data.model || '';
+                document.getElementById('ont-location').value = data.location || '';
+                document.getElementById('ont-notes').value = data.notes || '';
+                // optional ids
+                document.getElementById('ont-customer').value = data.customer_id || '';
+                document.getElementById('ont-olt').value = data.olt_id || '';
+            } else {
+                title.textContent = 'Nueva ONT / ONU';
+            }
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        }
+        function hideOntModal() {
+            const m = document.getElementById('ont-modal');
+            m.classList.add('hidden'); m.classList.remove('flex');
+        }
+        async function saveOnt(e) {
+            e.preventDefault();
+            const id = document.getElementById('ont-id').value;
+            const payload = {
+                gpon_sn: document.getElementById('ont-gpon').value,
+                mac_address: document.getElementById('ont-mac').value || null,
+                ip_address: document.getElementById('ont-ip').value || null,
+                model: document.getElementById('ont-model').value || null,
+                location: document.getElementById('ont-location').value || null,
+                notes: document.getElementById('ont-notes').value || null,
+            };
+            const cust = document.getElementById('ont-customer').value;
+            if (cust) payload.customer_id = parseInt(cust);
+            const olt = document.getElementById('ont-olt').value;
+            if (olt) payload.olt_id = parseInt(olt);
+            try {
+                if (id) {
+                    await apiFetch(`/api/v1/onts/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+                    showToast('ONT actualizado');
+                } else {
+                    await apiFetch('/api/v1/onts/', { method: 'POST', body: JSON.stringify(payload) });
+                    showToast('ONT creado');
+                }
+                hideOntModal();
+                fetchOntsForClientes();
+                fetchClients();
+            } catch (err) {
+                alert('Error: ' + err.message);
+            }
+        }
+
+        // ===== OLT Modal =====
+        function showOltModal(data = null) {
+            const modal = document.getElementById('olt-modal');
+            const form = document.getElementById('olt-form');
+            const title = document.getElementById('olt-modal-title');
+            form.reset();
+            document.getElementById('olt-id').value = '';
+            if (data) {
+                title.textContent = 'Editar OLT';
+                document.getElementById('olt-id').value = data.id || '';
+                document.getElementById('olt-name').value = data.name || '';
+                document.getElementById('olt-ip').value = data.ip_address || '';
+                document.getElementById('olt-location').value = data.location || '';
+                document.getElementById('olt-model').value = data.model || '';
+                document.getElementById('olt-firmware').value = data.firmware || '';
+            } else {
+                title.textContent = 'Nueva OLT';
+            }
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        }
+        function hideOltModal() {
+            const m = document.getElementById('olt-modal');
+            m.classList.add('hidden'); m.classList.remove('flex');
+        }
+        async function saveOlt(e) {
+            e.preventDefault();
+            const id = document.getElementById('olt-id').value;
+            const payload = {
+                name: document.getElementById('olt-name').value,
+                ip_address: document.getElementById('olt-ip').value,
+                location: document.getElementById('olt-location').value || null,
+                model: document.getElementById('olt-model').value || null,
+                firmware: document.getElementById('olt-firmware').value || null,
+            };
+            try {
+                if (id) {
+                    await apiFetch(`/api/v1/olts/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+                    showToast('OLT actualizada');
+                } else {
+                    await apiFetch('/api/v1/olts/', { method: 'POST', body: JSON.stringify(payload) });
+                    showToast('OLT creada');
+                }
+                hideOltModal();
+                fetchOltsForView();
+            } catch (err) {
+                alert('Error: ' + err.message);
+            }
+        }
+
+        async function fetchAlerts() {
+            try {
+                const summary = await apiFetch('/api/v1/telemetry/alerts/summary?limit=10');
+                const grid = document.getElementById('alerts-grid');
+                if (!grid) return;
+                grid.innerHTML = '';
+                let count = 0;
+                if (summary.olt_downs && summary.olt_downs.length) {
+                    count += summary.olt_downs.length;
+                    const card = document.createElement('div');
+                    card.className = 'alert-card bg-red-900/20 border border-red-500/40 p-4 rounded-3xl cursor-pointer hover:border-red-400';
+                    card.onclick = () => showAlertsDetail('olt_downs', summary.olt_downs, 'OLTs Caídas');
+                    card.innerHTML = `<div class="flex items-center gap-x-2 text-red-400 text-xs font-semibold mb-2"><i class="fa-solid fa-plug-circle-xmark"></i> OLT CAÍDA (${summary.olt_downs.length})</div>` + summary.olt_downs.slice(0,10).map(o => `<div class="text-sm mb-1 flex justify-between"><span class="font-medium">${o.name}</span> <span class="font-mono text-xs">${o.ip}</span></div>`).join('');
+                    grid.appendChild(card);
+                }
+                if (summary.critical_onus && summary.critical_onus.length) {
+                    count += summary.critical_onus.length;
+                    const card = document.createElement('div');
+                    card.className = 'alert-card bg-rose-900/20 border border-rose-400/40 p-3 rounded-3xl cursor-pointer hover:border-rose-300 overflow-hidden';
+                    // For per-ONU alerts we open the rich detail modal (full info + uptime visible)
+                    card.onclick = () => {
+                        const first = summary.critical_onus[0];
+                        if (first && first.gpon) showOntDetail(first.gpon);
+                        else showAlertsDetail('critical_onus', summary.critical_onus, 'ONUs con Problemas Graves (CRITICAL)');
+                    };
+                    const lines = summary.critical_onus.slice(0,8).map(o => renderCompactAlertLine(o)).join('');
+                    card.innerHTML = `<div class="text-rose-300 text-[10px] font-semibold mb-1">CRITICAL / GRAVES (${summary.critical_onus.length})</div>` + lines;
+                    grid.appendChild(card);
+                }
+                // Config changes (medium) from probe deltas
+                if (summary.config_changes && summary.config_changes.length) {
+                    count += summary.config_changes.length;
+                    const card = document.createElement('div');
+                    card.className = 'alert-card bg-amber-900/20 border border-amber-400/40 p-3 rounded-3xl cursor-pointer hover:border-amber-300 overflow-hidden';
+                    card.onclick = () => {
+                        const first = summary.config_changes[0];
+                        if (first && first.gpon) showOntDetail(first.gpon);
+                        else showAlertsDetail('config_changes', summary.config_changes, 'Cambios de Config (severidad media)');
+                    };
+                    const lines = summary.config_changes.slice(0,8).map(o => renderCompactAlertLine(o)).join('');
+                    card.innerHTML = `<div class="text-amber-300 text-[10px] font-semibold mb-1">CONFIG DRIFT (${summary.config_changes.length})</div>` + lines;
+                    grid.appendChild(card);
+                }
+                if (summary.mass_client_outages && summary.mass_client_outages.length) {
+                    count += summary.mass_client_outages.length;
+                    const card = document.createElement('div');
+                    card.className = 'alert-card bg-orange-900/20 border border-orange-400/40 p-3 rounded-3xl cursor-pointer hover:border-orange-300 overflow-hidden';
+                    card.onclick = () => showAlertsDetail('mass_client_outages', summary.mass_client_outages, 'Clientes masivamente impactados');
+                    const lines = summary.mass_client_outages.slice(0,8).map(o => {
+                        const g = o.gpon || '';
+                        const c = o.customer ? ` • ${o.customer}` : '';
+                        const up = (o.uptime_seconds != null) ? ` <span class="text-amber-400">UP ${parseInt(o.uptime_seconds)}s</span>` : '';
+                        return `<div class="text-xs font-mono mb-0.5">${g}${c}${up}</div>`;
+                    }).join('');
+                    card.innerHTML = `<div class="text-orange-300 text-[10px] font-semibold mb-1">IMPACTO MASIVO OLT (${summary.mass_client_outages.length})</div>` + lines;
+                    grid.appendChild(card);
+                }
+                if (summary.high_conntrack && summary.high_conntrack.length) {
+                    count += summary.high_conntrack.length;
+                    const card = document.createElement('div');
+                    card.className = 'alert-card bg-blue-900/20 border border-blue-400/40 p-3 rounded-3xl cursor-pointer hover:border-blue-300 overflow-hidden';
+                    card.onclick = () => {
+                        const first = summary.high_conntrack[0];
+                        if (first && first.gpon) showOntDetail(first.gpon);
+                        else showAlertsDetail('high_conntrack', summary.high_conntrack, 'Alta utilización Conntrack / NAT');
+                    };
+                    const lines = summary.high_conntrack.slice(0,8).map(o => renderCompactAlertLine(o)).join('');
+                    card.innerHTML = `<div class="text-blue-300 text-[10px] font-semibold mb-1">ALTA CONNTRACK (${summary.high_conntrack.length})</div>` + lines;
+                    grid.appendChild(card);
+                }
+                if (summary.high_unreplied && summary.high_unreplied.length) {
+                    count += summary.high_unreplied.length;
+                    const card = document.createElement('div');
+                    card.className = 'alert-card bg-indigo-900/20 border border-indigo-400/40 p-3 rounded-3xl cursor-pointer hover:border-indigo-300 overflow-hidden';
+                    card.onclick = () => {
+                        const first = summary.high_unreplied[0];
+                        if (first && first.gpon) showOntDetail(first.gpon);
+                        else showAlertsDetail('high_unreplied', summary.high_unreplied, 'Alto UNREPLIED (sesiones sin respuesta)');
+                    };
+                    const lines = summary.high_unreplied.slice(0,8).map(o => renderCompactAlertLine(o)).join('');
+                    card.innerHTML = `<div class="text-indigo-300 text-[10px] font-semibold mb-1">ALTO UNREPLIED (${summary.high_unreplied.length})</div>` + lines;
+                    grid.appendChild(card);
+                }
+                if (summary.high_syn_sent && summary.high_syn_sent.length) {
+                    count += summary.high_syn_sent.length;
+                    const card = document.createElement('div');
+                    card.className = 'alert-card bg-purple-900/20 border border-purple-400/40 p-3 rounded-3xl cursor-pointer hover:border-purple-300 overflow-hidden';
+                    card.onclick = () => {
+                        const first = summary.high_syn_sent[0];
+                        if (first && first.gpon) showOntDetail(first.gpon);
+                        else showAlertsDetail('high_syn_sent', summary.high_syn_sent, 'Alto SYN_SENT (handshakes TCP fallidos)');
+                    };
+                    const lines = summary.high_syn_sent.slice(0,8).map(o => renderCompactAlertLine(o)).join('');
+                    card.innerHTML = `<div class="text-purple-300 text-[10px] font-semibold mb-1">ALTO SYN_SENT (${summary.high_syn_sent.length})</div>` + lines;
+                    grid.appendChild(card);
+                }
+                if (summary.top_talker_issues && summary.top_talker_issues.length) {
+                    count += summary.top_talker_issues.length;
+                    const card = document.createElement('div');
+                    card.className = 'alert-card bg-teal-900/20 border border-teal-400/40 p-3 rounded-3xl cursor-pointer hover:border-teal-300 overflow-hidden';
+                    card.onclick = () => {
+                        const first = summary.top_talker_issues[0];
+                        if (first && first.gpon) showOntDetail(first.gpon);
+                        else showAlertsDetail('top_talker_issues', summary.top_talker_issues, 'Top Talker LAN con anomalías');
+                    };
+                    const lines = summary.top_talker_issues.slice(0,8).map(o => renderCompactAlertLine(o)).join('');
+                    card.innerHTML = `<div class="text-teal-300 text-[10px] font-semibold mb-1">TOP TALKER ANÓMALO (${summary.top_talker_issues.length})</div>` + lines;
+                    grid.appendChild(card);
+                }
+                if (count === 0) {
+                    grid.innerHTML = `<div class="col-span-3 bg-emerald-900/10 border border-emerald-600/30 p-4 rounded-3xl text-emerald-300 text-sm flex items-center gap-x-2"><i class="fa-regular fa-check-circle"></i> <span>Sin alertas activas. Todo estable.</span></div>`;
+                }
+                document.getElementById('alerts-count').textContent = `${count} activas`;
+
+                // Also show recent ONTs from probes so gpon/mac/wan updates are visible in main dashboard
+                // NOW CLICKABLE: opens "mas detalle" modal with basic stats + generate graph INSIDE
+                // Shows quick resumen: cliente (if linked), gpon/mac/ip + PING + SERVICES badges (before ver detalle)
+                try {
+                    const recentOnts = await apiFetch('/api/v1/onts/?limit=5');
+                    const recentDiv = document.getElementById('recent-onts-alerts');
+                    if (recentDiv) {
+                        recentDiv.innerHTML = '';
+                        if (recentOnts && recentOnts.length) {
+                            // ensure latestByGpon is populated (for status pills)
+                            if (Object.keys(latestByGpon).length === 0) {
+                                try {
+                                    const rec = await apiFetch('/api/v1/telemetry/recent?limit=100');
+                                    latestByGpon = {};
+                                    (rec || []).forEach(ev => { if (ev.gpon_sn && !latestByGpon[ev.gpon_sn]) latestByGpon[ev.gpon_sn] = ev; });
+                                } catch(_) {}
+                            }
+                            const tbl = document.createElement('table');
+                            tbl.className = 'w-full text-xs';
+                            recentOnts.forEach(o => {
+                                const ev = latestByGpon[o.gpon_sn];
+                                const pingSt = computePingStatus(ev);
+                                const svcSt = computeServicesStatus(ev);
+                                const cust = o.customer_name ? `<div class="text-emerald-300 text-[9px] leading-none">${o.customer_name}</div>` : '';
+                                let upBadge = '';
+                                if (ev && ev.uptime_seconds != null) {
+                                    const secs = parseInt(ev.uptime_seconds) || 0;
+                                    const ucls = (secs > 0 && secs < 300) ? 'bg-amber-500' : 'bg-slate-600';
+                                    upBadge = `<span class="inline px-1 py-px text-[8px] text-white rounded ${ucls}">UP ${secs}s</span>`;
+                                }
+                                // Show OLT if available (enriched from /api/v1/onts/)
+                                const oltInfo = o.olt_name ? `<div class="text-blue-400 text-[9px]">OLT: ${o.olt_name} ${o.olt_status ? '('+o.olt_status+')' : ''}</div>` : '';
+                                const tr = document.createElement('tr');
+                                tr.className = 'hover:bg-slate-800 cursor-pointer border-b border-slate-800 last:border-0';
+                                tr.innerHTML = `
+                                    <td class="py-1 pr-2 font-semibold text-emerald-300">${o.gpon_sn}${cust}${oltInfo}</td>
+                                    <td class="py-1 pr-2 font-mono text-slate-400">mac:${o.mac_address||'-'}<br>ip:${o.ip_address||'-'}</td>
+                                    <td class="py-1 text-slate-400">${o.last_seen_at ? formatTime(o.last_seen_at) : '-'}<br>
+                                        <span class="inline px-1 py-px text-[8px] text-white rounded ${pingSt.cls}">P:${pingSt.label}</span>
+                                        <span class="inline px-1 py-px text-[8px] text-white rounded ${svcSt.cls}">SVC:${svcSt.label}</span>
+                                        ${upBadge}
+                                    </td>
+                                    <td class="py-1 text-right space-x-1">
+                                        <button class="text-[9px] px-1 py-0 border border-blue-600 hover:bg-blue-900 rounded" onclick="event.stopImmediatePropagation(); pingRecentOnt(${o.id || 0}, this, '${o.gpon_sn}')">Ping</button>
+                                        <span class="text-blue-400 text-[10px]">detalle →</span>
+                                    </td>
+                                `;
+                                tr.onclick = () => showOntDetail(o.gpon_sn);
+                                tbl.appendChild(tr);
+                            });
+                            recentDiv.appendChild(tbl);
+                            // small hint
+                            const hint = document.createElement('div');
+                            hint.className = 'text-[9px] text-slate-500 mt-1';
+                            hint.textContent = 'Click fila → detalle. UP = uptime de la ONU (siempre visible para evitar falsas alertas por arranque reciente). Badges: PING + SERVICES.';
+                            recentDiv.appendChild(hint);
+                        } else {
+                            recentDiv.innerHTML = 'No ONTs from probes yet. Send data from ontprobe.';
+                        }
+                    }
+                } catch(e) {
+                    const recentDiv = document.getElementById('recent-onts-alerts');
+                    if (recentDiv) recentDiv.innerHTML = 'Error loading recent ONTs';
+                }
+            } catch(e) {
+                console.warn('Alerts error', e);
+                const grid = document.getElementById('alerts-grid');
+                if (grid) grid.innerHTML = `<div class="col-span-3 text-center py-8 text-slate-500">Error cargando alertas (usa login o dev bypass)</div>`;
+            }
+        }
+
+        async function fetchClients(force = false) {
+            if (!force && cachedClients) {
+                renderClientsTable(cachedClients);
+                return;
+            }
+            try {
+                const data = await apiFetch('/api/v1/customers/?limit=50');
+                cachedClients = data;
+                renderClientsTable(data);
+            } catch(e) {
+                console.warn(e);
+                const tbody = document.getElementById('clients-tbody');
+                if (tbody) tbody.innerHTML = '<tr><td colspan="4" class="px-6 py-4 text-center text-slate-500">Error cargando clientes</td></tr>';
+            }
+        }
+
+        function renderClientsTable(data) {
+            const tbody = document.getElementById('clients-tbody');
+            if (!tbody) return;
+            tbody.innerHTML = '';
+            data.forEach(c => {
+                const ont = (c.onts && c.onts[0]) || {};
+                const ev = latestByGpon[ont.gpon_sn || c.gpon_sn];
+                const pingSt = computePingStatus(ev);
+                const svcSt = computeServicesStatus(ev);
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td class="px-6 py-3"><div class="font-medium">${c.name}</div></td>
+                    <td class="px-4 py-3 font-mono text-xs">${ont.gpon_sn || c.gpon_sn || '-'}<br>
+                        <span class="inline px-1 py-px text-[8px] text-white rounded ${pingSt.cls}">P:${pingSt.label}</span>
+                        <span class="inline px-1 py-px text-[8px] text-white rounded ${svcSt.cls}">SVC:${svcSt.label}</span>
+                    </td>
+                    <td class="px-4 py-3 font-mono text-xs">${ont.ip_address || '-'}</td>
+                    <td class="px-4 py-3 text-center text-xs text-slate-400">${ont.last_seen_at ? formatTime(ont.last_seen_at) : '--'}</td>
+                    <td class="px-2 text-right space-x-1">
+                        <button class="text-xs px-2 py-0.5 border border-slate-600 hover:bg-slate-800 rounded" onclick="event.stopImmediatePropagation(); editClient(${c.id}, '${c.name}', '${c.phone || ''}', '${c.email || ''}', '${c.address || ''}')">Editar</button>
+                        <button class="text-xs px-2 py-0.5 bg-red-700 hover:bg-red-600 rounded" onclick="event.stopImmediatePropagation(); deleteClient(${c.id}, this)">Borrar</button>
+                    </td>
+                `;
+                const gponForDetail = ont.gpon_sn || c.gpon_sn;
+                tr.onclick = () => {
+                    if (gponForDetail) {
+                        showOntDetail(gponForDetail);
+                    } else {
+                        showSimpleClientInfo(c);
+                    }
+                };
+                tbody.appendChild(tr);
+            });
+        }
+
+        function filterClientsTable() {
+            const term = (document.getElementById('client-search') || {}).value.toLowerCase() || '';
+            const rows = document.querySelectorAll('#clients-tbody tr');
+            rows.forEach(r => {
+                r.style.display = r.textContent.toLowerCase().includes(term) ? '' : 'none';
+            });
+        }
+
+        function showCreateClientModal() {
+            showClientModal();
+        }
+
+        function showCreateOLTModal() {
+            showOltModal();  // create wrapper so "Nueva OLT" button works
+        }
+
+        // Helpers for summary status badges (PING from probe DNS pings + SERVICES from http_tests)
+        function computePingStatus(ev) {
+            if (!ev) return {label: 'UNK', cls: 'bg-slate-500'};
+            const avg = ev.ping_8_avg != null ? ev.ping_8_avg : 999;
+            let loss = 0;
+            const p = ev.data && (ev.data.ping || ev.data.pings) || {};
+            const p8 = p.google_8_8_8_8 || p['8.8.8.8'] || {};
+            if (p8.packet_loss != null) loss = p8.packet_loss;
+            if (avg < 25 && loss < 2) return {label: 'GOOD', cls: 'bg-emerald-500'};
+            if (avg < 70 && loss < 6) return {label: 'REG', cls: 'bg-amber-500'};
+            return {label: 'BAD', cls: 'bg-red-500'};
+        }
+        function computeServicesStatus(ev) {
+            if (!ev) return {label: 'UNK', cls: 'bg-slate-500'};
+            const tests = (ev.data && ev.data.http_tests) || [];
+            if (!tests.length) return {label: 'UNK', cls: 'bg-slate-500'};
+            const badCount = tests.filter(t => t.ok === false || t.ok === 'false').length;
+            if (badCount === 0) return {label: 'GOOD', cls: 'bg-emerald-500'};
+            if (badCount <= Math.ceil(tests.length * 0.3)) return {label: 'REG', cls: 'bg-amber-500'};
+            return {label: 'BAD', cls: 'bg-red-500'};
+        }
+
+        // Compact line for alarm summary cards: only GPON + Cliente + MAC + IP + Uptime
+        // Uptime is always shown to avoid false alerts on recent boot.
+        function renderCompactAlertLine(o) {
+            const cust = o.customer ? `<span class="text-emerald-300">${o.customer}</span>` : '';
+            const mac = o.mac ? `mac:${o.mac}` : '';
+            const ip = o.ip ? `ip:${o.ip}` : '';
+            let up = '';
+            if (o.uptime_seconds != null) {
+                const secs = parseInt(o.uptime_seconds) || 0;
+                const cls = (secs > 0 && secs < 300) ? 'bg-amber-500' : 'bg-slate-600';
+                const label = (secs > 0 && secs < 300) ? `UP ${secs}s (recién enc.)` : `UP ${secs}s`;
+                up = `<span class="inline px-1 py-px text-[9px] text-white rounded ${cls}">${label}</span>`;
+            }
+            return `
+                <div class="text-xs font-mono leading-tight mb-0.5">
+                    <span class="font-semibold text-emerald-300">${o.gpon || ''}</span>
+                    ${cust ? ' • ' + cust : ''}
+                    <span class="text-slate-400 block">${mac} ${ip}</span>
+                    ${up ? '<span class="block mt-0.5">' + up + '</span>' : ''}
+                </div>
+            `;
+        }
+
+        function editClient(id, name, phone, email, address) {
+            showClientModal({id, name, phone, email, address});
+        }
+
+        async function deleteClient(id, btn) {
+            if (!confirm('¿Borrar cliente?')) return;
+            const old = btn.textContent; btn.textContent = '...';
+            try {
+                await apiFetch(`/api/v1/customers/${id}`, {method: 'DELETE'});
+                showToast('Cliente borrado');
+                fetchClients();
+            } catch(e) { alert('Error: ' + e.message); }
+            finally { btn.textContent = old; }
+        }
+
+        async function fetchOntsForClientes(force = false) {
+            if (!force && cachedOnts) {
+                renderOntsTable(cachedOnts);
+                return;
+            }
+            try {
+                const data = await apiFetch('/api/v1/onts/?limit=50');
+                cachedOnts = data;
+                // refresh latest telemetry for status pills (limit high but recent events, good for 1000+ as we only show 50)
+                try {
+                    const rec = await apiFetch('/api/v1/telemetry/recent?limit=400');
+                    latestByGpon = {};
+                    (rec || []).forEach(ev => {
+                        if (ev.gpon_sn && !latestByGpon[ev.gpon_sn]) latestByGpon[ev.gpon_sn] = ev;
+                    });
+                } catch(_) {}
+                renderOntsTable(data);
+            } catch(e) {
+                console.warn(e);
+                const tbody = document.getElementById('onts-clientes-tbody');
+                if (tbody) tbody.innerHTML = '<tr><td colspan="4" class="px-6 py-4 text-center text-slate-500">Error</td></tr>';
+            }
+        }
+
+        function renderOntsTable(data) {
+            const tbody = document.getElementById('onts-clientes-tbody');
+            if (!tbody) return;
+            tbody.innerHTML = '';
+            data.forEach(o => {
+                const tr = document.createElement('tr');
+                tr.className = 'hover:bg-slate-800 cursor-pointer';
+                const ev = latestByGpon[o.gpon_sn];
+                const pingSt = computePingStatus(ev);
+                const svcSt = computeServicesStatus(ev);
+                const cust = o.customer_name ? `<div class="text-emerald-300 text-[10px]">${o.customer_name}</div>` : '';
+                const oltInfo = o.olt_name ? `<div class="text-blue-400 text-[9px] mt-0.5">OLT: ${o.olt_name} ${o.olt_status ? '('+o.olt_status+')' : ''}</div>` : '';
+                tr.innerHTML = `
+                    <td class="px-6 py-3 font-mono text-xs">${o.gpon_sn}<br><span class="text-slate-500">${o.mac_address || ''}</span>${cust}${oltInfo}</td>
+                    <td class="px-4 py-3 font-mono text-xs">${o.ip_address || '-'}</td>
+                    <td class="px-4 py-3 text-center text-xs text-slate-400">${o.last_seen_at ? formatTime(o.last_seen_at) : '--'}<br>
+                        <span class="inline-block mt-0.5 px-1 py-px text-[9px] text-white rounded ${pingSt.cls}">P:${pingSt.label}</span>
+                        <span class="inline-block mt-0.5 px-1 py-px text-[9px] text-white rounded ${svcSt.cls}">SVC:${svcSt.label}</span>
+                    </td>
+                    <td class="px-2 text-right space-x-1">
+                        <button class="text-xs px-2 py-0.5 border border-slate-600 hover:bg-slate-800 rounded" onclick="event.stopImmediatePropagation(); showOntDetail('${o.gpon_sn}')">Detalle</button>
+                        <button class="text-xs px-2 py-0.5 border border-slate-600 hover:bg-slate-800 rounded" onclick="event.stopImmediatePropagation(); editOnt(${o.id}, '${o.gpon_sn}', '${o.mac_address||''}', '${o.ip_address||''}', '${o.location||''}')">Editar</button>
+                        <button class="text-xs px-2 py-0.5 bg-red-700 hover:bg-red-600 rounded" onclick="event.stopImmediatePropagation(); deleteOnt(${o.id}, this)">Borrar</button>
+                        <button class="text-xs px-2 py-0.5 bg-blue-700 hover:bg-blue-600 rounded" onclick="event.stopImmediatePropagation(); pingOntNow(${o.id}, this)">Ping IP</button>
+                    </td>
+                `;
+                tr.onclick = (ev) => { if (!ev.target.closest('button')) showOntDetail(o.gpon_sn); };
+                tbody.appendChild(tr);
+            });
+        }
+
+        function editOnt(id, gpon, mac, ip, loc) {
+            showOntModal({id, gpon_sn: gpon, mac_address: mac, ip_address: ip, location: loc});
+        }
+
+        async function deleteOnt(id, btn) {
+            if (!confirm('¿Borrar ONU/ONT?')) return;
+            const old = btn.textContent; btn.textContent = '...';
+            try {
+                await apiFetch(`/api/v1/onts/${id}`, {method: 'DELETE'});
+                showToast('ONT borrado');
+                fetchOntsForClientes();
+                fetchClients();
+            } catch(e) { alert('Error: ' + e.message); }
+            finally { btn.textContent = old; }
+        }
+
+        async function pingOntNow(id, btn) {
+            const old = btn.textContent; btn.textContent='...'; btn.disabled=true;
+            try {
+                const r = await apiFetch(`/api/v1/onts/${id}/ping`, {method:'POST'});
+                showToast(`ONT ${r.ont ? r.ont.gpon_sn : id}: ${r.status} ${r.ping_ms||''}ms`);
+                fetchOntsForClientes();
+            } catch(e){ alert('Error ping: '+e.message); }
+            finally { btn.textContent=old; btn.disabled=false; }
+        }
+
+        function showSimpleClientInfo(c) {
+            // Fallback for clients without linked ONT/gpon yet. Prefer showOntDetail for real probe-linked clients.
+            const msg = `Cliente: ${c.name}\n\nEste cliente aún no tiene ONT/ONU con gpon_sn vinculado desde probe.\nUsa la sección ONTs en esta vista o crea el match por GPON/MAC.\nAlertas de impacto se muestran en Dashboard de Alerta.`;
+            // Use toast + console instead of alert (no more raw json alerts)
+            showToast('Ver detalle completo en ONTs con GPON de probe (click fila o botón Detalle)');
+            console.log('[Hyperion] client info:', msg);
+        }
+
+        async function fetchOltsForView(force = false) {
+            if (!force && cachedOlts) {
+                renderOltsTable(cachedOlts);
+                return;
+            }
+            try {
+                const data = await apiFetch('/api/v1/olts/');
+                cachedOlts = data;
+                renderOltsTable(data);
+            } catch(e){ console.warn(e); }
+        }
+
+        function renderOltsTable(data) {
+            const tbody = document.getElementById('olts-tbody');
+            if (!tbody) return;
+            tbody.innerHTML = '';
+            data.forEach(olt => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td class="px-6 py-3 font-medium">${olt.name}</td>
+                    <td class="px-4 py-3 font-mono text-xs">${olt.ip_address}</td>
+                    <td class="px-4 py-3 text-xs">${olt.location || '-'}</td>
+                    <td class="px-4 py-3 text-center"><span class="stat-pill ${olt.status==='DOWN'?'bg-red-500':'bg-emerald-500'}">${olt.status}</span></td>
+                    <td class="px-4 py-3 text-center text-xs">${olt.last_ping_ms ?? '-'}</td>
+                    <td class="px-2 text-right space-x-1">
+                        <button class="text-xs px-2 py-0.5 border border-slate-600 hover:bg-slate-800 rounded" onclick="editOlt(${olt.id}, '${olt.name}', '${olt.ip_address}', '${olt.location||''}')">Editar</button>
+                        <button class="text-xs px-2 py-0.5 bg-blue-700 hover:bg-blue-600 rounded" onclick="pingOltNow(${olt.id}, this)">Ping</button>
+                        <button class="text-xs px-2 py-0.5 bg-violet-700 hover:bg-violet-600 rounded" onclick="generateGraphForOlt(${olt.id})">Gráficas</button>
+                        <button class="text-xs px-2 py-0.5 bg-red-700 hover:bg-red-600 rounded" onclick="deleteOlt(${olt.id}, this)">Borrar</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function editOlt(id, name, ip, loc) {
+            showOltModal({id, name, ip_address: ip, location: loc});
+        }
+
+        async function pingOltNow(id, btn) {
+            const old = btn.textContent; btn.textContent='...'; btn.disabled=true;
+            try {
+                const r = await apiFetch(`/api/v1/olts/${id}/ping`, {method:'POST'});
+                showToast(`OLT: ${r.status} ${r.ping_ms||''}ms`);
+                fetchOltsForView();
+            } catch(e){ alert('Error ping: '+e.message); }
+            finally { btn.textContent=old; btn.disabled=false; }
+        }
+
+        async function deleteOlt(id, btn) {
+            if (!confirm('¿Borrar OLT?')) return;
+            const old = btn.textContent; btn.textContent = '...';
+            try {
+                await apiFetch(`/api/v1/olts/${id}`, {method: 'DELETE'});
+                showToast('OLT borrada');
+                fetchOltsForView();
+            } catch(e) { alert('Error: ' + e.message); }
+            finally { btn.textContent = old; }
+        }
+
+        async function generateOptimizedDashboardClientes(fromOverride, toOverride) {
+            let from, to;
+            if (fromOverride && toOverride) {
+                from = fromOverride; to = toOverride;
+            } else {
+                const r = computeRange('1d');
+                from = r.from; to = r.to;
+            }
+
+            let series = [], summary = '';
+            let pingOntData = [], pingOltData = [];
+            try {
+                const stats = await apiFetch(`/api/v1/telemetry/stats/range?from_ts=${from}&to_ts=${to}`);
+                series = stats.series || [];
+                pingOntData = stats.ping_ont || [];
+                pingOltData = stats.ping_olt || [];
+                summary = `${series.length} eventos • Ping prom: ${stats.avg_ping_8 || '—'} ms`;
+            } catch(e) {
+                series = generateDemoSeries(from, to);
+                summary = `${series.length} eventos (demo)`;
+            }
+            if (!series || series.length === 0) {
+                series = generateDemoSeries(from, to);
+                summary = `${series.length} eventos (demo)`;
+            }
+            openCleanGraphTab(series, from, to, summary, pingOntData, []);  // only ONU ping for client graphs, no OLT
+        }
+
+        function generateOptimizedDashboardClientesPreset(preset) {
+            const r = computeRange(preset);
+            generateOptimizedDashboardClientes(r.from, r.to);
+        }
+
+        function generateDemoSeries(fromStr, toStr) {
+            const series = []; let t = new Date(fromStr); const end = new Date(toStr);
+            while (t < end) {
+                const p8 = 12 + Math.random()*22;
+                const g = 100 + Math.random()*60;
+                const c = 80 + Math.random()*50;
+                const d = 50 + Math.random()*30;
+                series.push({
+                    ts: t.toISOString(),
+                    ping_8: p8,
+                    ping_1: p8-3+Math.random()*6,
+                    service_time_ms: (g + c + d) / 3,
+                    services: { "Google": g, "Cloudflare DNS": c, "DNS Local": d }
+                });
+                t = new Date(t.getTime() + 1000*60*7);
+            }
+            return series;
+        }
+
+        async function generateGraphForCurrentDetail(fromOverride, toOverride) {
+            if (!currentDetailGpon) { alert('No hay ONT seleccionado'); return; }
+            let from, to;
+            if (fromOverride && toOverride) {
+                from = fromOverride; to = toOverride;
+            } else {
+                const r = computeRange('1d');
+                from = r.from; to = r.to;
+            }
+
+            let series = [], summary = '';
+            let pingOntData = [], pingOltData = [];
+            try {
+                const stats = await apiFetch(`/api/v1/telemetry/stats/range?from_ts=${encodeURIComponent(from)}&to_ts=${encodeURIComponent(to)}&gpon_sn=${encodeURIComponent(currentDetailGpon)}`);
+                series = stats.series || [];
+                pingOntData = stats.ping_ont || [];
+                pingOltData = stats.ping_olt || [];
+                summary = `${currentDetailGpon} • ${series.length} eventos • Ping prom: ${stats.avg_ping_8 || '—'} ms`;
+            } catch(e) {
+                series = generateDemoSeries(from, to);
+                summary = `${currentDetailGpon} • ${series.length} eventos (demo)`;
+            }
+            if (!series || series.length === 0) {
+                // user range gave no data for this gpon; fallback to wide range to pull real probe events (so graphs not empty)
+                try {
+                    const wideFrom = '2026-06-01T00:00';
+                    const wideTo = new Date().toISOString().slice(0,16);
+                    const wide = await apiFetch(`/api/v1/telemetry/stats/range?from_ts=${encodeURIComponent(wideFrom)}&to_ts=${encodeURIComponent(wideTo)}&gpon_sn=${encodeURIComponent(currentDetailGpon)}`);
+                    if (wide && wide.series && wide.series.length > 0) {
+                        series = wide.series;
+                        pingOntData = wide.ping_ont || [];
+                        summary = `${currentDetailGpon} • ${series.length} eventos (rango amplio) • Ping prom: ${wide.avg_ping_8 || '—'} ms`;
+                        from = wideFrom;
+                        to = wideTo;
+                    } else {
+                        series = generateDemoSeries(from, to);
+                        summary = `${currentDetailGpon} • ${series.length} eventos (demo)`;
+                    }
+                } catch(e2) {
+                    series = generateDemoSeries(from, to);
+                    summary = `${currentDetailGpon} • ${series.length} eventos (demo)`;
+                }
+            }
+            openCleanGraphTab(series, from, to, summary, pingOntData, []);  // only ONU ping for client graphs, no OLT
+        }
+
+        function generateGraphForCurrentDetailPreset(preset) {
+            const r = computeRange(preset);
+            generateGraphForCurrentDetail(r.from, r.to);
+        }
+
+        async function generateGraphForOlt(oltId) {
+            const r = computeRange(lastOltPreset || '1d');
+            const from = r.from, to = r.to;
+
+            let series = [], summary = '';
+            let pingOltData = [];
+            try {
+                const stats = await apiFetch(`/api/v1/telemetry/stats/range?from_ts=${encodeURIComponent(from)}&to_ts=${encodeURIComponent(to)}&olt_id=${oltId}`);
+                series = stats.series || [];
+                pingOltData = stats.ping_olt || [];
+                summary = `OLT id=${oltId} • ${pingOltData.length} pings en rango • Ping prom OLT: ${pingOltData.length ? (pingOltData.reduce((a,p)=>a+(p.ping_ms||0),0)/pingOltData.length).toFixed(1) : '—'} ms`;
+            } catch(e) {
+                series = [];
+                summary = `OLT ${oltId} (sin datos o demo)`;
+            }
+            openCleanGraphTab(series, from, to, summary, [], pingOltData);
+        }
+
+        function openCleanGraphTab(series, from, to, summary, pingOntData = [], pingOltData = []) {
+            const labels = series.map((s, i) => (i + 1).toString());
+            const p8 = series.map(s => s.ping_8);
+            const p1 = series.map(s => s.ping_1);
+            const loss8 = series.map(s => s.loss_8 != null ? s.loss_8 : 0);
+            const loss1 = series.map(s => s.loss_1 != null ? s.loss_1 : 0);
+            const svc = series.map(s => s.service_time_ms);
+
+            const total = series.length;
+            let good = 0, regular = 0, bad = 0;
+            let maxPing = 0;
+            series.forEach(s => {
+                const cls = (s.classification || '').toUpperCase();
+                if (cls === 'GOOD') good++;
+                else if (cls === 'REGULAR') regular++;
+                else if (cls === 'BAD' || cls === 'CRITICAL') bad++;
+                const pp = Math.max(s.ping_8 || 0, s.ping_1 || 0);
+                if (pp > maxPing) maxPing = pp;
+            });
+            const regPct = total ? ((regular / total) * 100).toFixed(2) : 0;
+            const badPct = total ? ((bad / total) * 100).toFixed(2) : 0;
+
+            let svcDatasets;
+            const hasPerService = series.some(s => s.services && Object.keys(s.services || {}).length > 0);
+            if (hasPerService) {
+                const allServices = new Set();
+                series.forEach(s => { if (s.services) Object.keys(s.services).forEach(k => allServices.add(k)); });
+                const serviceNames = Array.from(allServices).sort();
+                svcDatasets = serviceNames.map((name) => ({
+                    label: name + ' total sec',
+                    data: series.map(s => (s.services && s.services[name] != null) ? s.services[name] : null),
+                    borderWidth: 2,
+                    tension: 0.3
+                }));
+            } else {
+                svcDatasets = [{ label: 'Servicios (prom) total sec', data: svc, borderWidth: 2, tension: 0.3 }];
+            }
+
+            const pingOnt = pingOntData || [];
+            const pingOlt = pingOltData || [];
+            const logEntries = series;
+            const incidents = series;
+
+            let extraCharts = '';
+            if (pingOnt.length) {
+                extraCharts += '<div class="chart-card"><h2>Ping hacia la ONU (WAN IP)</h2><canvas id="pingOntChart"></canvas></div>';
+            }
+            if (pingOlt.length) {
+                extraCharts += '<div class="chart-card"><h2>Ping hacia la OLT</h2><canvas id="pingOltChart"></canvas></div>';
+            }
+            const showProbeCharts = series && series.length > 0;
+            const probeChartsHtml = showProbeCharts ? '<div class="chart-card"><h2>Ping DNS (8.8.8.8 / 1.1.1.1)</h2><canvas id="pingChart"></canvas></div><div class="chart-card"><h2>Perdida de paquetes (%)</h2><canvas id="qualityChart"></canvas></div><div class="chart-card"><h2>Tiempo por servicio (ms)</h2><canvas id="serviceChart"></canvas></div>' : '';
+            const probeChartCode = showProbeCharts ? 'new Chart(document.getElementById("pingChart"), {type:"line", data:{labels:labels, datasets:[{label:"Ping 8.8.8.8 AVG ms", data:p8, borderWidth:2, tension:0.3}, {label:"Ping 1.1.1.1 AVG ms", data:p1, borderWidth:2, tension:0.3}] }});\nnew Chart(document.getElementById("qualityChart"), {type:"line", data:{labels:labels, datasets:[{label:"Loss 8.8.8.8 %", data:loss8, borderWidth:2, tension:0.3}, {label:"Loss 1.1.1.1 %", data:loss1, borderWidth:2, tension:0.3}] }});\nnew Chart(document.getElementById("serviceChart"), {type:"line", data:{labels:labels, datasets:svcDatasets }});\n' : '';
+
+            // Precompute formatted labels for ping charts (Honduras local time)
+            const pingOntLabels = pingOnt.map(function(p){ return formatTs(p.ts || ''); });
+            const pingOntMs = pingOnt.map(function(p){ return p.ping_ms || 0; });
+            const pingOltLabels = pingOlt.map(function(p){ return formatTs(p.ts || ''); });
+            const pingOltMs = pingOlt.map(function(p){ return p.ping_ms || 0; });
+
+            // Build skeleton with " for attrs (no external script srcs here to avoid document.write blocking warnings; we append scripts via DOM after write for reliable load)
+            const skeleton = '<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Hyperion Graficas - Rango ' + from + ' a ' + to + '</title>' +
+                '<style>body{margin:0;font-family:Arial,sans-serif;background:#0f172a;color:#e5e7eb}.container{max-width:1300px;margin:auto;padding:24px}.header{background:linear-gradient(135deg,#111827,#1e293b);border:1px solid #334155;border-radius:18px;padding:24px;margin-bottom:20px}h1{margin:0 0 8px 0}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:20px}.card{background:#111827;border:1px solid #334155;border-radius:16px;padding:18px}.card h3{margin:0;font-size:14px;color:#94a3b8}.card .value{font-size:28px;font-weight:bold;margin-top:8px}.chart-card{background:#111827;border:1px solid #334155;border-radius:16px;padding:20px;margin-bottom:20px}table{width:100%;border-collapse:collapse;background:#111827;border-radius:16px;overflow:hidden}th,td{padding:12px;border-bottom:1px solid #334155;text-align:left}th{background:#1e293b;color:#cbd5e1}.badge{padding:6px 10px;border-radius:999px;font-weight:bold;font-size:12px}.badge.good{background:#22c55e;color:#000}.badge.regular{background:#f59e0b;color:#000}.badge.bad{background:#ef4444;color:#000}.footer{color:#94a3b8;font-size:13px;margin-top:30px}@media(max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:600px){.grid{grid-template-columns:1fr}}</style></head><body>' +
+                '<div class="container"><div class="header"><h1>Hyperion Graficas</h1><p>Rango: <b>' + from + ' → ' + to + '</b></p><p>' + (summary || '') + '</p><div class="status">Ver detalles de intentos abajo (paginado)</div></div>' +
+                '<div class="grid"><div class="card"><h3>Eventos</h3><div class="value">' + total + '</div></div><div class="card"><h3>GOOD</h3><div class="value">' + good + '</div></div><div class="card"><h3>REGULAR</h3><div class="value">' + regular + '</div></div><div class="card"><h3>BAD/CRIT</h3><div class="value">' + bad + '</div></div></div>' +
+                '<div class="grid"><div class="card"><h3>REG %</h3><div class="value">' + regPct + '%</div></div><div class="card"><h3>BAD %</h3><div class="value">' + badPct + '%</div></div><div class="card"><h3>Max Ping</h3><div class="value">' + maxPing.toFixed(1) + ' ms</div></div><div class="card"><h3>Incidentes</h3><div class="value">' + incidents.length + '</div></div></div>' +
+                probeChartsHtml + extraCharts +
+                '<div class="chart-card"><h2>Incidentes / Logs (por intento) - todos los registros, 10 por pagina</h2><table><thead><tr><th>#</th><th>Hora (local Honduras)</th><th>Clase</th><th>Razon</th></tr></thead><tbody id="logs-tbody"></tbody></table><div style="margin-top:10px;display:flex;gap:10px;align-items:center;"><button class="px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs" onclick="prevPage()">Anterior</button><span id="page-info" class="text-xs"></span><button class="px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs" onclick="nextPage()">Siguiente</button></div></div></body></html>';
+            // Dynamic script injected: NO backticks at all (use ' and " and +), local time formatting, full logEntriesData, 10-per-page client pagination for 28+ attempts
+            const dynScript = 'function formatLocal(tsStr){if(!tsStr)return"-";try{var d=new Date(tsStr);if(isNaN(d.getTime()))return tsStr.replace("T"," ").replace(/\\+.*/,"").slice(0,19);d=new Date(d.getTime()-6*60*60*1000);var y=d.getFullYear(),mo=String(d.getMonth()+1).padStart(2,"0"),da=String(d.getDate()).padStart(2,"0"),h=String(d.getHours()).padStart(2,"0"),mi=String(d.getMinutes()).padStart(2,"0"),se=String(d.getSeconds()).padStart(2,"0");return y+"-"+mo+"-"+da+" "+h+":"+mi+":"+se;}catch(e){return tsStr.replace("T"," ").replace(/\\+.*/,"").slice(0,19);}}\n' +
+                'const labels=' + JSON.stringify(labels) + ', p8=' + JSON.stringify(p8) + ', p1=' + JSON.stringify(p1) + ', loss8=' + JSON.stringify(loss8) + ', loss1=' + JSON.stringify(loss1) + ', svcDatasets=' + JSON.stringify(svcDatasets) + ';\n' +
+                'const logEntriesData = ' + JSON.stringify(logEntries || []) + ';\n' +
+                'let currentLogPage = 1; const logPageSize = 10;\n' +
+                'function prevPage(){ if(currentLogPage>1){ currentLogPage--; renderLogsPage(); } }\n' +
+                'function nextPage(){ var tp=Math.ceil(logEntriesData.length/logPageSize)||1; if(currentLogPage<tp){ currentLogPage++; renderLogsPage(); } }\n' +
+                'function renderLogsPage(){\n' +
+                '  var tbody = document.getElementById("logs-tbody"); if(!tbody) return;\n' +
+                '  var start = (currentLogPage-1)*logPageSize;\n' +
+                '  var pageData = logEntriesData.slice(start, start+logPageSize);\n' +
+                '  tbody.innerHTML = pageData.map(function(i,idx){\n' +
+                '    var num = start + idx + 1;\n' +
+                '    var hora = formatLocal(i.ts || "");\n' +
+                '    var cls = i.classification || "";\n' +
+                '    var bclass = cls.toLowerCase()==="good" ? "good" : (cls.toLowerCase()==="regular" ? "regular" : "bad");\n' +
+                '    var razon = (i.reason || "").slice(0,60);\n' +
+                '    return "<tr><td>" + num + "</td><td>" + hora + "</td><td><span class=\\"badge " + bclass + "\\">" + cls + "</span></td><td>" + razon + "</td></tr>";\n' +
+                '  }).join("") || "<tr><td colspan=4>Sin registros</td></tr>";\n' +
+                '  var totalP = Math.ceil(logEntriesData.length / logPageSize) || 1;\n' +
+                '  var infoEl = document.getElementById("page-info");\n' +
+                '  if(infoEl) infoEl.textContent = "Pagina " + currentLogPage + " de " + totalP + " (total " + logEntriesData.length + ")";\n' +
+                '}\n' +
+                probeChartCode +
+                (pingOnt.length ? 'new Chart(document.getElementById("pingOntChart"), {type:"line", data:{labels:' + JSON.stringify(pingOntLabels) + ', datasets:[{label:"Ping ONU ms", data:' + JSON.stringify(pingOntMs) + ', borderWidth:2, tension:0.3}] }});\n' : '') +
+                (pingOlt.length ? 'new Chart(document.getElementById("pingOltChart"), {type:"line", data:{labels:' + JSON.stringify(pingOltLabels) + ', datasets:[{label:"Ping OLT ms", data:' + JSON.stringify(pingOltMs) + ', borderWidth:2, tension:0.3}] }});\n' : '') +
+                'renderLogsPage();';
+
+            // Write static structure first (no external scripts via write to avoid browser deprecation/blocking of parser-blocking CDNs).
+            // Then append <script> elements properly via DOM + onload chain so Tailwind (for classes) + Chart.js load reliably, then our init code (data + new Chart + pagination).
+            const w = window.open('', '_blank');
+            if (!w) {
+                alert('No se pudo abrir la pestaña de gráficas. Por favor permite pop-ups para este sitio (el botón de generar gráficas requiere abrir una nueva pestaña).');
+                return;
+            }
+            const d = w.document;
+            d.open();
+            d.write(skeleton);
+            d.close();
+
+            // Load Tailwind CDN for utility classes (scans DOM on load)
+            const tw = d.createElement('script');
+            tw.src = 'https://cdn.tailwindcss.com';
+            tw.onload = function() {
+                // Then Chart.js
+                const ch = d.createElement('script');
+                ch.src = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';
+                ch.onload = function() {
+                    // Finally our data+logic (defines the onclick globals too, runs charts + initial renderLogsPage)
+                    const init = d.createElement('script');
+                    init.textContent = dynScript;
+                    d.head.appendChild(init);
+                };
+                d.head.appendChild(ch);
+            };
+            d.head.appendChild(tw);
+        }
+
+        function showToast(m) {
+            const t = document.createElement('div');
+            t.className = 'fixed bottom-4 right-4 bg-slate-800 border border-slate-700 px-4 py-2 rounded-2xl text-sm z-[200]';
+            t.textContent = m; document.body.appendChild(t); setTimeout(()=>t.remove(), 2200);
+        }
+
+        function refreshCurrentView() {
+            if (currentView === 'alerts') fetchAlerts();
+            else if (currentView === 'clientes') { fetchOntsForClientes(true); fetchClients(true); }
+            else if (currentView === 'olts') fetchOltsForView();
+        }
+
+        function showOntDetail(gpon_sn) {
+            if (!gpon_sn) return;
+            currentDetailGpon = gpon_sn;
+            const modal = document.getElementById('ont-detail-modal');
+            if (!modal) return;
+            // reset
+            document.getElementById('detail-gpon').textContent = gpon_sn;
+            document.getElementById('detail-meta').textContent = 'Cargando...';
+            document.getElementById('detail-class-badge').innerHTML = '';
+            document.getElementById('detail-reason').textContent = '';
+            document.getElementById('detail-ping8').textContent = '—';
+            document.getElementById('detail-ping8-loss').textContent = '';
+            document.getElementById('detail-ping1').textContent = '—';
+            document.getElementById('detail-ping1-loss').textContent = '';
+            document.getElementById('detail-services').innerHTML = 'Cargando servicios...';
+            document.getElementById('detail-retrans').textContent = '—';
+            document.getElementById('detail-obs').textContent = '';
+            // conntrack + OLT info
+            document.getElementById('detail-nf-count').textContent = '—';
+            document.getElementById('detail-nf-max').textContent = '—';
+            document.getElementById('detail-nf-pct').textContent = '—';
+            document.getElementById('detail-nf-tcp').textContent = '—';
+            document.getElementById('detail-nf-udp').textContent = '—';
+            document.getElementById('detail-nf-icmp').textContent = '—';
+            document.getElementById('detail-nf-unreplied').textContent = '—';
+            document.getElementById('detail-nf-syn').textContent = '—';
+            document.getElementById('detail-nf-top-ip').textContent = '—';
+            document.getElementById('detail-nf-top-sess').textContent = '—';
+            document.getElementById('detail-nf-top-tcp').textContent = '—';
+            document.getElementById('detail-nf-top-unr').textContent = '—';
+            document.getElementById('detail-nf-top-syn').textContent = '—';
+            modal.classList.remove('hidden'); modal.classList.add('flex');
+
+            loadOntDetailData(gpon_sn);
+        }
+
+        function hideOntDetail() {
+            const m = document.getElementById('ont-detail-modal');
+            if (m) { m.classList.add('hidden'); m.classList.remove('flex'); }
+            currentDetailGpon = null;
+        }
+
+        async function loadOntDetailData(gpon_sn) {
+            try {
+                const recents = await apiFetch(`/api/v1/telemetry/recent?gpon_sn=${encodeURIComponent(gpon_sn)}&limit=1`);
+                const latest = (recents && recents.length) ? recents[0] : null;
+
+                let ontInfo = null;
+                try {
+                    const all = await apiFetch('/api/v1/onts/?limit=100');
+                    ontInfo = (all || []).find(x => x.gpon_sn === gpon_sn) || null;
+                } catch(e){}
+
+                const metaEl = document.getElementById('detail-meta');
+                const badge = document.getElementById('detail-class-badge');
+                const reasonEl = document.getElementById('detail-reason');
+                const p8El = document.getElementById('detail-ping8');
+                const p8lEl = document.getElementById('detail-ping8-loss');
+                const p1El = document.getElementById('detail-ping1');
+                const p1lEl = document.getElementById('detail-ping1-loss');
+                const svcEl = document.getElementById('detail-services');
+                const retransEl = document.getElementById('detail-retrans');
+                const obsEl = document.getElementById('detail-obs');
+
+                const localLastSeen = (ontInfo && ontInfo.last_seen_at) ? formatTs(ontInfo.last_seen_at) : (latest && latest.received_at ? formatTs(latest.received_at) : '—');
+                // Keep original UTC for reference (safest for debugging)
+                const utcLastSeen = (ontInfo && ontInfo.last_seen_at) ? (ontInfo.last_seen_at.replace('T',' ').replace(/\+.*/,'').slice(0,19)) : (latest && latest.received_at ? (latest.received_at.replace('T',' ').replace(/\+.*/,'').slice(0,19)) : '—');
+                const mac = ontInfo ? (ontInfo.mac_address || '-') : '-';
+                const ip = ontInfo ? (ontInfo.ip_address || (latest && latest.wan_ip) || '-') : (latest && latest.wan_ip || '-');
+                const model = ontInfo ? (ontInfo.model || '-') : '-';
+
+                let oltPart = '';
+                if (ontInfo && ontInfo.olt_name) {
+                    const oltStatus = ontInfo.olt_status ? ` (${ontInfo.olt_status})` : '';
+                    oltPart = ` • OLT: ${ontInfo.olt_name}${oltStatus}`;
+                }
+
+                metaEl.textContent = `MAC: ${mac} • IP: ${ip} • Modelo: ${model}${oltPart} • Último visto: ${localLastSeen} (UTC: ${utcLastSeen})`;
+
+                if (latest) {
+                    const cls = latest.classification || 'UNKNOWN';
+                    let badgeCls = 'bg-emerald-600 text-white';
+                    if (cls === 'CRITICAL') badgeCls = 'bg-red-600 text-white';
+                    else if (cls === 'BAD') badgeCls = 'bg-orange-600 text-white';
+                    else if (cls === 'REGULAR') badgeCls = 'bg-amber-500 text-black';
+                    badge.innerHTML = `<span class="${badgeCls} px-3 py-0.5 rounded-full">${cls}</span>`;
+
+                    // === UPTIME ALWAYS VISIBLE (critical to avoid false alerts on recent boot) ===
+                    const upSec = (latest.uptime_seconds != null) ? parseInt(latest.uptime_seconds) : (latest.data && latest.data.uptime_seconds ? parseInt(latest.data.uptime_seconds) : null);
+                    let upHtml = '';
+                    if (upSec != null && !isNaN(upSec)) {
+                        const isRecent = upSec > 0 && upSec < 300;
+                        const upCls = isRecent ? 'bg-amber-500 text-black' : 'bg-slate-700 text-white';
+                        const note = isRecent ? ' — Recién encendida (fallas transitorias esperadas)' : '';
+                        upHtml = `<div class="mt-1"><span class="inline-block px-2 py-0.5 text-xs rounded ${upCls} font-mono">UPTIME: ${upSec}s${note}</span></div>`;
+                    } else {
+                        upHtml = `<div class="mt-1 text-[10px] text-slate-500">UPTIME: no reportado por el probe</div>`;
+                    }
+                    // Insert uptime right after classification badge
+                    if (badge && badge.parentNode) {
+                        const existingUp = document.getElementById('detail-uptime');
+                        if (existingUp) existingUp.remove();
+                        const upDiv = document.createElement('div');
+                        upDiv.id = 'detail-uptime';
+                        upDiv.innerHTML = upHtml;
+                        badge.parentNode.insertBefore(upDiv, badge.nextSibling);
+                    }
+
+                    reasonEl.textContent = latest.reason || '';
+
+                    p8El.textContent = (latest.ping_8_avg != null) ? `${latest.ping_8_avg} ms` : '—';
+                    p1El.textContent = (latest.ping_1_avg != null) ? `${latest.ping_1_avg} ms` : '—';
+                    retransEl.textContent = (latest.tcp_retrans_segs != null) ? latest.tcp_retrans_segs : '—';
+
+                    const d = latest.data || {};
+                    const pingSec = d.ping || d.pings || {};
+                    const p8d = pingSec.google_8_8_8_8 || pingSec['8.8.8.8'] || {};
+                    const p1d = pingSec.cloudflare_1_1_1_1 || pingSec['1.1.1.1'] || {};
+                    if (p8d.packet_loss != null) p8lEl.textContent = `(pérdida ${p8d.packet_loss}%)`;
+                    if (p1d.packet_loss != null) p1lEl.textContent = `(pérdida ${p1d.packet_loss}%)`;
+
+                    const httpTests = d.http_tests || [];
+                    if (Array.isArray(httpTests) && httpTests.length) {
+                        let html = '';
+                        let sum = 0, cnt = 0;
+                        httpTests.forEach(h => {
+                            const t = (h.total_ms != null) ? h.total_ms : h.total;
+                            if (t != null) { sum += parseFloat(t); cnt++; }
+                            const name = h.name || h.url || 'svc';
+                            const tot = (t != null) ? `${parseFloat(t).toFixed(0)}ms` : '';
+                            html += `<div class="flex justify-between"><span class="text-slate-300">${name}</span><span class="text-emerald-300">${tot}</span></div>`;
+                        });
+                        const avg = cnt ? (sum / cnt).toFixed(1) : null;
+                        if (avg) html += `<div class="pt-1 text-[10px] text-slate-400 border-t border-slate-800">Promedio total: ${avg} ms</div>`;
+                        svcEl.innerHTML = html;
+                    } else {
+                        svcEl.innerHTML = '<span class="text-slate-500">Sin http_tests en último evento.</span>';
+                    }
+
+                    const reason = (latest.reason || '').toUpperCase();
+                    if (reason.includes('TCP_RETRANSMISSIONS') || reason.includes('RETRANS')) {
+                        obsEl.innerHTML = '✅ Clasificado GOOD porque las pruebas de servicios (http) fueron exitosas. TCP retransmisiones presentes pero no impactaron la conectividad de servicios.';
+                    } else if (latest.classification === 'GOOD') {
+                        obsEl.textContent = 'Buen estado según probe.';
+                    }
+
+                    // New conntrack metrics from local_net_diag
+                    const local = d.local_net_diag || {};
+                    const nfC = local.nf_conntrack_count != null ? local.nf_conntrack_count : '—';
+                    const nfM = local.nf_conntrack_max != null ? local.nf_conntrack_max : '—';
+                    let nfPct = '—';
+                    if (nfM !== '—' && nfM > 0 && nfC !== '—') {
+                        nfPct = ((nfC / nfM) * 100).toFixed(1);
+                    }
+                    const nfT = local.nf_tcp_sessions != null ? local.nf_tcp_sessions : '—';
+                    const nfU = local.nf_udp_sessions != null ? local.nf_udp_sessions : '—';
+                    const nfI = local.nf_icmp_sessions != null ? local.nf_icmp_sessions : '—';
+                    const nfUn = local.nf_unreplied != null ? local.nf_unreplied : '—';
+                    const nfSy = local.nf_syn_sent != null ? local.nf_syn_sent : '—';
+                    const topIp = local.nf_top_lan_ip || '—';
+                    const topS = local.nf_top_lan_sessions != null ? local.nf_top_lan_sessions : '—';
+                    const topT = local.nf_top_lan_tcp_sessions != null ? local.nf_top_lan_tcp_sessions : '—';
+                    const topUn = local.nf_top_lan_unreplied != null ? local.nf_top_lan_unreplied : '—';
+                    const topSy = local.nf_top_lan_syn_sent != null ? local.nf_top_lan_syn_sent : '—';
+
+                    const cEl = document.getElementById('detail-nf-count'); if (cEl) cEl.textContent = nfC;
+                    const mEl = document.getElementById('detail-nf-max'); if (mEl) mEl.textContent = nfM;
+                    const pEl = document.getElementById('detail-nf-pct'); if (pEl) pEl.textContent = nfPct;
+                    const tEl = document.getElementById('detail-nf-tcp'); if (tEl) tEl.textContent = nfT;
+                    const uEl = document.getElementById('detail-nf-udp'); if (uEl) uEl.textContent = nfU;
+                    const iEl = document.getElementById('detail-nf-icmp'); if (iEl) iEl.textContent = nfI;
+                    const unEl = document.getElementById('detail-nf-unreplied'); if (unEl) unEl.textContent = nfUn;
+                    const syEl = document.getElementById('detail-nf-syn'); if (syEl) syEl.textContent = nfSy;
+                    const tipEl = document.getElementById('detail-nf-top-ip'); if (tipEl) tipEl.textContent = topIp;
+                    const tsEl = document.getElementById('detail-nf-top-sess'); if (tsEl) tsEl.textContent = topS;
+                    const ttEl = document.getElementById('detail-nf-top-tcp'); if (ttEl) ttEl.textContent = topT;
+                    const tuEl = document.getElementById('detail-nf-top-unr'); if (tuEl) tuEl.textContent = topUn;
+                    const tsyEl = document.getElementById('detail-nf-top-syn'); if (tsyEl) tsyEl.textContent = topSy;
+                } else {
+                    badge.innerHTML = '<span class="bg-slate-600 px-3 py-0.5 rounded-full">SIN EVENTOS</span>';
+                    reasonEl.textContent = 'Aún no hay TelemetryEvent para este gpon_sn. Envía datos desde la ONU.';
+                    svcEl.innerHTML = '<span class="text-slate-500">—</span>';
+                }
+            } catch (e) {
+                console.warn('loadOntDetailData err', e);
+                const metaEl = document.getElementById('detail-meta');
+                if (metaEl) metaEl.textContent = 'Error cargando datos (revisa login/dev bypass).';
+            }
+        }
+
+        async function pingCurrentDetailOnt() {
+            if (!currentDetailGpon) return;
+            try {
+                const onts = await apiFetch('/api/v1/onts/?limit=100');
+                const ont = (onts || []).find(o => o.gpon_sn === currentDetailGpon);
+                if (!ont || !ont.id) { showToast('ONT no encontrado para ping'); return; }
+                const r = await apiFetch(`/api/v1/onts/${ont.id}/ping`, {method:'POST'});
+                showToast(`Ping ${currentDetailGpon}: ${r.status} ${r.ping_ms || ''}ms`);
+                loadOntDetailData(currentDetailGpon);
+            } catch(e){ alert('Error ping: ' + e.message); }
+        }
+
+        async function refreshCurrentDetail() {
+            if (currentDetailGpon) await loadOntDetailData(currentDetailGpon);
+        }
+
+        async function pingRecentOnt(id, btn, gpon) {
+            if (!id) { showToast('ID no disponible para ping'); showOntDetail(gpon); return; }
+            const old = btn.textContent; btn.textContent='...'; btn.disabled=true;
+            try {
+                const r = await apiFetch(`/api/v1/onts/${id}/ping`, {method:'POST'});
+                showToast(`Ping ${gpon || id}: ${r.status} ${r.ping_ms||''}ms`);
+                fetchAlerts();
+            } catch(e){ alert('Error ping: '+e.message); }
+            finally { btn.textContent=old; btn.disabled=false; }
+        }
+
+        function showAlertsDetail(type, items, title) {
+            const modal = document.getElementById('alerts-detail-modal');
+            const titleEl = document.getElementById('alerts-detail-title');
+            const bodyEl = document.getElementById('alerts-detail-body');
+            if (!modal || !titleEl || !bodyEl) return;
+            titleEl.textContent = title || 'Detalle de Alertas';
+            bodyEl.innerHTML = '';
+            currentAlertsItems = items || [];
+            if (!currentAlertsItems.length) {
+                bodyEl.innerHTML = '<div class="text-slate-400">No hay detalles adicionales.</div>';
+            } else {
+                const list = document.createElement('div');
+                list.className = 'space-y-1';
+                currentAlertsItems.forEach((item, idx) => {
+                    const div = document.createElement('div');
+                    div.className = 'bg-slate-800 border border-slate-700 rounded-xl p-3 text-xs font-mono overflow-x-auto max-w-full break-words';
+                    let html = '';
+                    if (type === 'olt_downs') {
+                        html = `<div><span class="text-red-400">OLT:</span> ${item.name} <span class="text-slate-400">(${item.ip})</span> last_ping:${item.last_ping || '-'}</div>`;
+                    } else if (type === 'critical_onus' || type === 'config_changes' || type === 'mass_client_outages' || type === 'high_conntrack' || type === 'high_unreplied' || type === 'high_syn_sent' || type === 'top_talker_issues') {
+                        html = `<div><span class="text-rose-400">${item.gpon || item.olt_name || ''}</span> — ${ (item.reason || item.olt_name || '').substring(0,100) }</div><div class="text-[10px] text-slate-400 mt-0.5">${item.ts ? formatTs(item.ts) : ''}</div>`;
+                    } else {
+                        html = `<pre class="whitespace-pre-wrap max-w-full overflow-x-auto text-[10px]">${JSON.stringify(item, null, 2)}</pre>`;
+                    }
+                    div.innerHTML = html;
+                    list.appendChild(div);
+                });
+                bodyEl.appendChild(list);
+            }
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        }
+
+        function hideAlertsDetail() {
+            const m = document.getElementById('alerts-detail-modal');
+            if (m) { m.classList.add('hidden'); m.classList.remove('flex'); }
+            currentAlertsItems = [];
+        }
+
+        // Safety shims (in case) - now real functions are defined above, these won't override
+        if (typeof switchView === "undefined") { window.switchView = function(v){ document.querySelectorAll(".view").forEach(x=>x.classList.remove("active")); var t=document.getElementById("view-"+v); if(t)t.classList.add("active"); }; }
+        if (typeof showLoginModal === "undefined") { window.showLoginModal = function(){ var m=document.getElementById("login-modal"); if(m){m.classList.remove("hidden");m.classList.add("flex");} }; }
+
+        if (typeof bootstrap === "undefined") {
+            window.bootstrap = async function(){
+                if(typeof updateClock==="function") updateClock();
+                try{ var fd=new URLSearchParams(); fd.append("username","tech");fd.append("password","tech123");
+                     var r=await fetch("/api/v1/auth/login",{method:"POST",body:fd}); if(r.ok){var d=await r.json(); if(typeof setAuthState==="function")setAuthState(d.user);} }catch(e){}
+                // initial load
+                currentView = 'alerts';
+                if (typeof fetchAlerts === "function") {
+                    fetchAlerts();
+                    fetchOntsForClientes();
+                }
+                // set interval for refresh
+                setInterval(() => {
+                    if (currentView === 'alerts') { if(typeof fetchAlerts==="function") fetchAlerts(); if(typeof fetchOntsForClientes==="function") fetchOntsForClientes(); }
+                    else if (currentView === 'clientes') { if(typeof fetchOntsForClientes==="function") fetchOntsForClientes(); if(typeof fetchClients==="function") fetchClients(); }
+                    else if (currentView === 'olts') { if(typeof fetchOltsForView==="function") fetchOltsForView(); }
+                }, 30000);
+            };
+        }
+        window.onload = bootstrap;
+    </script>
+</body>
+</html>

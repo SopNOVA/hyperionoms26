@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+.env
+.env.local
+*.log
+data/
+uploads/
+
+# Docker
+docker-compose.override.yml
+
+# Alembic (keep versions, but sometimes people ignore compiled)
+# alembic/versions/*.pyc
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+
+# SQLite database (datos locales, no versionar)
+*.db
+*.db-shm
+*.db-wal
+
+# Dashboard históricos (artefactos de desarrollo)
+app/static/dashboard.html.broken-*
+app/static/dashboard.html.fixed-*
+app/static/dashboard.html.working-*
+
+# Backups
+backups/
+
+# Exports de cliente
+ont_*_dashboard.html
+
+# Claude Code local config
+.claude/

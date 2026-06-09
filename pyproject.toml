@@ -1,0 +1,62 @@
+[project]
+name = "hyperion-onms"
+version = "0.2.0"
+description = "Hyperion-ONMS - Sistema moderno de Monitoreo de Redes Ópticas (ONMS) para ISPs. Soporta OLTs, matching clientes, sensor ping, dashboard moderno y más."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+    {name = "Equipo Técnico ISP"}
+]
+
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
+    "email-validator>=2.1.0",  # required for EmailStr in user schemas
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.13.0",
+    "psycopg[binary]>=3.2.0",
+    "python-jose[cryptography]>=3.3.0",
+    "passlib[bcrypt]>=1.7.4",
+    "bcrypt>=3.1.0,<4.0.0",  # IMPORTANT: pin <4.0 to avoid passlib + bcrypt compatibility breakage (the "__about__" error and 72-byte limit). Run `pip install "bcrypt<4.0.0" --force-reinstall` if you see bcrypt errors.
+    "python-multipart>=0.0.9",
+    "httpx>=0.27.0",  # for tests and future agent calls
+    "apscheduler>=3.10.4",
+    "icmplib>=3.0.4",  # cross-platform pure-python ping (Windows + Linux friendly)
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+    "pre-commit>=3.8.0",
+]
+
+[tool.setuptools.packages.find]
+# Only include the 'app' package. Explicitly exclude 'alembic' (migrations),
+# 'tests', 'scripts', etc. so setuptools doesn't complain about multiple
+# top-level packages in flat layout.
+include = ["app*"]
+exclude = ["alembic*", "tests*", "scripts*", ".*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

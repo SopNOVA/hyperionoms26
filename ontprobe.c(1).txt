@@ -1,0 +1,1615 @@
+/*
+ * ontprobe.c
+ *
+ * ONTPROBE - Agente ligero para ONU / ONT
+ *
+ * Uso:
+ *   /etc/scripts/ontprobe <SERVER_URL> <TOTAL_ATTEMPTS> <INTERVAL_SECONDS> <ONT_ID>
+ *
+ * Ejemplo:
+ *   /etc/scripts/ontprobe http://192.168.10.13:8080/ont-monitor 1 300 AUTO
+ *
+ * Si ONT_ID=AUTO:
+ *   - Lee GPON_SN desde: flash get GPON_SN
+ *   - Usa GPON_SN como identificador principal de la ONU.
+ *
+ * Funciones principales:
+ *   - Ping 8.8.8.8 y 1.1.1.1
+ *   - Pruebas HTTP/HTTPS a Google, Cloudflare, Facebook, Netflix, YouTube, TikTok
+ *   - Lectura de WAN IP, gateway, ruta default
+ *   - Lectura de conexiones TCP/UDP desde /proc/net
+ *   - Lectura de GPON_SN y GPON_ONU_MODEL
+ *   - Lectura de DNS WAN/LAN desde flash/config:
+ *       WAN: DNSV4IPAddr1, DNSV4IPAddr2
+ *       LAN: LAN_DHCP_DNS_OPT, DHCPS_DNS1, DHCPS_DNS2, DHCPS_DNS3
+ *   - Detección de cambios de configuración
+ *   - Cola temporal en /tmp con máximo 10 registros pendientes
+ *
+ * Compilar:
+ *   export BR=$HOME/mips-lab/buildroot/buildroot-2025.02
+ *   export SYSROOT=$BR/output/host/mips-buildroot-linux-uclibc/sysroot
+ *   export PATH=$BR/output/host/bin:$PATH
+ *
+ *   mips-buildroot-linux-uclibc-gcc ontprobe.c -o ontprobe \
+ *     --sysroot=$SYSROOT \
+ *     -I$SYSROOT/usr/include \
+ *     -L$SYSROOT/usr/lib \
+ *     -Os \
+ *     -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -latomic
+ *
+ *   mips-buildroot-linux-uclibc-strip ontprobe
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+#include <curl/curl.h>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
+#define MAX_BUF 24576
+#define STATE_FILE "/tmp/ontprobe_state.txt"
+#define PENDING_FILE "/tmp/ontprobe_pending.jsonl"
+#define MAX_PENDING_LINES 10
+
+#define CURL_TIMEOUT_SECONDS 8
+#define HTTP_SITE_COUNT 6
+
+#define CA_BUNDLE "/etc/scripts/ssl/ca-certificates.crt"
+
+typedef struct {
+    char iface[64];
+    char wan_ip[64];
+    char gateway[64];
+
+    /* Resolver local que ve /etc/resolv.conf, puede ser 127.0.0.1 o ::1 */
+    char system_dns[256];
+
+    /* DNS reales de WAN según configuración */
+    char wan_dns1[64];
+    char wan_dns2[64];
+
+    /* DNS reales activos en /var/dnsmas.conf, ejemplo: server=8.8.8.8@nas0_0 */
+    char active_wan_dns[256];
+
+    /* DNS entregados a clientes LAN por DHCP */
+    char lan_dhcp_dns_opt[32];
+    char lan_dns1[64];
+    char lan_dns2[64];
+    char lan_dns3[64];
+
+    double uptime_seconds;
+} ConfigState;
+
+typedef struct {
+    int tcp_total;
+    int tcp_established;
+    int tcp_syn_sent;
+    int tcp_syn_recv;
+    int tcp_time_wait;
+    int tcp_listen;
+    int tcp_close_wait;
+    int udp_total;
+
+    /* Métricas de NAT/conntrack desde /proc/net/nf_conntrack */
+    long nf_conntrack_count;
+    long nf_conntrack_max;
+    long nf_tcp_sessions;
+    long nf_udp_sessions;
+    long nf_icmp_sessions;
+    long nf_unreplied;
+    long nf_syn_sent;
+
+    /* IP LAN que más sesiones genera en nf_conntrack */
+    char nf_top_lan_ip[64];
+    long nf_top_lan_sessions;
+    long nf_top_lan_tcp_sessions;
+    long nf_top_lan_udp_sessions;
+    long nf_top_lan_unreplied;
+    long nf_top_lan_syn_sent;
+
+    long tcp_curr_estab;
+    long tcp_retrans_segs;
+    long tcp_active_opens;
+    long tcp_passive_opens;
+    long tcp_attempt_fails;
+    long tcp_estab_resets;
+} NetDiag;
+
+typedef struct {
+    char name[64];
+    char url[256];
+    long http_code;
+    int curl_code;
+    double dns_ms;
+    double tcp_ms;
+    double tls_ms;
+    double ttfb_ms;
+    double total_ms;
+    int ok;
+} HttpResult;
+
+typedef struct {
+    int ok;
+    int packet_loss;
+    double avg_ms;
+} PingResult;
+
+static void trim_newline(char *s) {
+    if (!s) return;
+
+    size_t len = strlen(s);
+
+    while (len > 0 &&
+           (s[len - 1] == '\n' ||
+            s[len - 1] == '\r' ||
+            s[len - 1] == ' ' ||
+            s[len - 1] == '\t')) {
+        s[len - 1] = 0;
+        len--;
+    }
+}
+
+static void json_escape(const char *src, char *dst, size_t dst_size) {
+    size_t j = 0;
+
+    if (!src || !dst || dst_size == 0) return;
+
+    for (size_t i = 0; src[i] && j + 2 < dst_size; i++) {
+        char c = src[i];
+
+        if (c == '"' || c == '\\') {
+            dst[j++] = '\\';
+            dst[j++] = c;
+        } else if (c == '\n') {
+            dst[j++] = '\\';
+            dst[j++] = 'n';
+        } else if (c == '\r') {
+            dst[j++] = '\\';
+            dst[j++] = 'r';
+        } else if ((unsigned char)c < 32) {
+            dst[j++] = ' ';
+        } else {
+            dst[j++] = c;
+        }
+    }
+
+    dst[j] = 0;
+}
+
+static int file_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static int run_cmd_value(const char *cmd, const char *prefix, char *out, size_t out_size) {
+    FILE *fp;
+    char line[256];
+
+    if (!out || out_size == 0) return -1;
+
+    out[0] = 0;
+
+    fp = popen(cmd, "r");
+    if (!fp) return -1;
+
+    while (fgets(line, sizeof(line), fp)) {
+        trim_newline(line);
+
+        if (strncmp(line, prefix, strlen(prefix)) == 0) {
+            snprintf(out, out_size, "%s", line + strlen(prefix));
+            pclose(fp);
+            return 0;
+        }
+    }
+
+    pclose(fp);
+    return -1;
+}
+
+static void get_flash_value(const char *mib, const char *prefix, char *out, size_t out_size, const char *fallback) {
+    char cmd[256];
+
+    snprintf(cmd, sizeof(cmd), "flash get %s 2>/dev/null", mib);
+
+    if (run_cmd_value(cmd, prefix, out, out_size) != 0 || out[0] == 0) {
+        snprintf(out, out_size, "%s", fallback);
+    }
+}
+
+static void get_gpon_sn(char *out, size_t out_size) {
+    get_flash_value("GPON_SN", "GPON_SN=", out, out_size, "UNKNOWN_GPON_SN");
+}
+
+static void get_gpon_model(char *out, size_t out_size) {
+    get_flash_value("GPON_ONU_MODEL", "GPON_ONU_MODEL=", out, out_size, "UNKNOWN_MODEL");
+}
+
+static void append_dns(char *dns, size_t dns_size, const char *ns) {
+    if (!dns || !ns || ns[0] == 0) return;
+
+    if (strlen(dns) + strlen(ns) + 2 < dns_size) {
+        if (strlen(dns) > 0) strcat(dns, ",");
+        strcat(dns, ns);
+    }
+}
+
+static void get_active_wan_dns_from_dnsmasq(ConfigState *st) {
+    FILE *f = fopen("/var/dnsmas.conf", "r");
+    char line[256];
+
+    st->active_wan_dns[0] = 0;
+
+    if (!f) {
+        snprintf(st->active_wan_dns, sizeof(st->active_wan_dns), "unknown");
+        return;
+    }
+
+    while (fgets(line, sizeof(line), f)) {
+        char dns_ip[64];
+        char ifname[64];
+
+        trim_newline(line);
+
+        /*
+         * Ejemplo real:
+         *   server=8.8.8.8@nas0_0
+         *   server=1.1.1.1@nas0_0
+         */
+        if (sscanf(line, "server=%63[^@]@%63s", dns_ip, ifname) == 2) {
+            if (strcmp(ifname, "nas0_0") == 0 || strstr(ifname, "nas") == ifname) {
+                append_dns(st->active_wan_dns, sizeof(st->active_wan_dns), dns_ip);
+            }
+        }
+    }
+
+    fclose(f);
+
+    if (st->active_wan_dns[0] == 0) {
+        snprintf(st->active_wan_dns, sizeof(st->active_wan_dns), "unknown");
+    }
+}
+
+static void get_config_dns_from_flash(ConfigState *st) {
+    get_flash_value("DNSV4IPAddr1", "DNSV4IPAddr1=", st->wan_dns1, sizeof(st->wan_dns1), "unknown");
+    get_flash_value("DNSV4IPAddr2", "DNSV4IPAddr2=", st->wan_dns2, sizeof(st->wan_dns2), "unknown");
+
+    get_flash_value("LAN_DHCP_DNS_OPT", "LAN_DHCP_DNS_OPT=", st->lan_dhcp_dns_opt, sizeof(st->lan_dhcp_dns_opt), "unknown");
+    get_flash_value("DHCPS_DNS1", "DHCPS_DNS1=", st->lan_dns1, sizeof(st->lan_dns1), "unknown");
+    get_flash_value("DHCPS_DNS2", "DHCPS_DNS2=", st->lan_dns2, sizeof(st->lan_dns2), "unknown");
+    get_flash_value("DHCPS_DNS3", "DHCPS_DNS3=", st->lan_dns3, sizeof(st->lan_dns3), "unknown");
+
+    get_active_wan_dns_from_dnsmasq(st);
+}
+
+static double get_uptime_seconds(void) {
+    FILE *f = fopen("/proc/uptime", "r");
+    double up = 0.0;
+
+    if (!f) return 0.0;
+
+    fscanf(f, "%lf", &up);
+    fclose(f);
+
+    return up;
+}
+
+/*
+ * /proc/net/route normalmente guarda gateway en little-endian.
+ * Ejemplo:
+ *   01068E0A => 10.142.6.1
+ */
+static void hex_gateway_to_ip(const char *hex, char *out, size_t out_size) {
+    /*
+     * En esta ONU Realtek:
+     *   0A8E0601 => 10.142.6.1
+     * La versión anterior lo mostraba invertido: 1.6.142.10.
+     */
+    unsigned int b1 = 0, b2 = 0, b3 = 0, b4 = 0;
+
+    if (!hex || !out || strlen(hex) < 8) {
+        snprintf(out, out_size, "unknown");
+        return;
+    }
+
+    if (sscanf(hex, "%2x%2x%2x%2x", &b1, &b2, &b3, &b4) == 4) {
+        snprintf(out, out_size, "%u.%u.%u.%u", b1, b2, b3, b4);
+    } else {
+        snprintf(out, out_size, "unknown");
+    }
+}
+
+static int get_default_route(char *iface, size_t iface_size, char *gateway, size_t gateway_size) {
+    FILE *f = fopen("/proc/net/route", "r");
+    char line[512];
+
+    if (!f) return -1;
+
+    fgets(line, sizeof(line), f);
+
+    while (fgets(line, sizeof(line), f)) {
+        char ifname[64];
+        char destination[64];
+        char gw_hex[64];
+        int flags;
+
+        if (sscanf(line, "%63s %63s %63s %X", ifname, destination, gw_hex, &flags) == 4) {
+            if (strcmp(destination, "00000000") == 0) {
+                snprintf(iface, iface_size, "%s", ifname);
+                hex_gateway_to_ip(gw_hex, gateway, gateway_size);
+                fclose(f);
+                return 0;
+            }
+        }
+    }
+
+    fclose(f);
+    return -1;
+}
+
+static int get_iface_ip(const char *iface, char *ip, size_t ip_size) {
+    int fd;
+    struct ifreq ifr;
+    struct sockaddr_in *sin;
+
+    if (!iface || !ip) return -1;
+
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", iface);
+
+    if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    sin = (struct sockaddr_in *)&ifr.ifr_addr;
+    snprintf(ip, ip_size, "%s", inet_ntoa(sin->sin_addr));
+
+    close(fd);
+    return 0;
+}
+
+static void read_dns_file(const char *path, char *dns, size_t dns_size) {
+    FILE *f = fopen(path, "r");
+    char line[256];
+
+    if (!f) return;
+
+    while (fgets(line, sizeof(line), f)) {
+        char ns[128];
+
+        if (sscanf(line, "nameserver %127s", ns) == 1) {
+            append_dns(dns, dns_size, ns);
+        }
+    }
+
+    fclose(f);
+}
+
+static void get_system_dns_servers(char *dns, size_t dns_size) {
+    dns[0] = 0;
+
+    /*
+     * En esta ONU puede aparecer 127.0.0.1 o ::1 porque usa DNS proxy local.
+     * NO lo tratamos como error. Lo reportamos como system_dns.
+     */
+    read_dns_file("/etc/resolv.conf", dns, dns_size);
+    read_dns_file("/tmp/resolv.conf", dns, dns_size);
+    read_dns_file("/var/resolv.conf", dns, dns_size);
+    read_dns_file("/tmp/ppp/resolv.conf", dns, dns_size);
+    read_dns_file("/var/ppp/resolv.conf", dns, dns_size);
+    read_dns_file("/etc/ppp/resolv.conf", dns, dns_size);
+
+    if (dns[0] == 0) {
+        snprintf(dns, dns_size, "unknown");
+    }
+}
+
+static void get_current_state(ConfigState *st) {
+    memset(st, 0, sizeof(ConfigState));
+
+    st->uptime_seconds = get_uptime_seconds();
+
+    if (get_default_route(st->iface, sizeof(st->iface), st->gateway, sizeof(st->gateway)) != 0) {
+        snprintf(st->iface, sizeof(st->iface), "unknown");
+        snprintf(st->gateway, sizeof(st->gateway), "unknown");
+    }
+
+    if (strcmp(st->iface, "unknown") != 0) {
+        if (get_iface_ip(st->iface, st->wan_ip, sizeof(st->wan_ip)) != 0) {
+            snprintf(st->wan_ip, sizeof(st->wan_ip), "unknown");
+        }
+    } else {
+        snprintf(st->wan_ip, sizeof(st->wan_ip), "unknown");
+    }
+
+    get_system_dns_servers(st->system_dns, sizeof(st->system_dns));
+    get_config_dns_from_flash(st);
+}
+
+static int load_previous_state(ConfigState *st) {
+    FILE *f = fopen(STATE_FILE, "r");
+    char line[512];
+
+    if (!f) return -1;
+
+    memset(st, 0, sizeof(ConfigState));
+
+    while (fgets(line, sizeof(line), f)) {
+        trim_newline(line);
+
+        if (strncmp(line, "iface=", 6) == 0) {
+            snprintf(st->iface, sizeof(st->iface), "%s", line + 6);
+        } else if (strncmp(line, "wan_ip=", 7) == 0) {
+            snprintf(st->wan_ip, sizeof(st->wan_ip), "%s", line + 7);
+        } else if (strncmp(line, "gateway=", 8) == 0) {
+            snprintf(st->gateway, sizeof(st->gateway), "%s", line + 8);
+        } else if (strncmp(line, "system_dns=", 11) == 0) {
+            snprintf(st->system_dns, sizeof(st->system_dns), "%s", line + 11);
+        } else if (strncmp(line, "wan_dns1=", 9) == 0) {
+            snprintf(st->wan_dns1, sizeof(st->wan_dns1), "%s", line + 9);
+        } else if (strncmp(line, "wan_dns2=", 9) == 0) {
+            snprintf(st->wan_dns2, sizeof(st->wan_dns2), "%s", line + 9);
+        } else if (strncmp(line, "active_wan_dns=", 15) == 0) {
+            snprintf(st->active_wan_dns, sizeof(st->active_wan_dns), "%s", line + 15);
+        } else if (strncmp(line, "lan_dhcp_dns_opt=", 17) == 0) {
+            snprintf(st->lan_dhcp_dns_opt, sizeof(st->lan_dhcp_dns_opt), "%s", line + 17);
+        } else if (strncmp(line, "lan_dns1=", 9) == 0) {
+            snprintf(st->lan_dns1, sizeof(st->lan_dns1), "%s", line + 9);
+        } else if (strncmp(line, "lan_dns2=", 9) == 0) {
+            snprintf(st->lan_dns2, sizeof(st->lan_dns2), "%s", line + 9);
+        } else if (strncmp(line, "lan_dns3=", 9) == 0) {
+            snprintf(st->lan_dns3, sizeof(st->lan_dns3), "%s", line + 9);
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+static void save_current_state(const ConfigState *st) {
+    FILE *f = fopen(STATE_FILE, "w");
+
+    if (!f) return;
+
+    fprintf(f, "iface=%s\n", st->iface);
+    fprintf(f, "wan_ip=%s\n", st->wan_ip);
+    fprintf(f, "gateway=%s\n", st->gateway);
+    fprintf(f, "system_dns=%s\n", st->system_dns);
+    fprintf(f, "wan_dns1=%s\n", st->wan_dns1);
+    fprintf(f, "wan_dns2=%s\n", st->wan_dns2);
+    fprintf(f, "active_wan_dns=%s\n", st->active_wan_dns);
+    fprintf(f, "lan_dhcp_dns_opt=%s\n", st->lan_dhcp_dns_opt);
+    fprintf(f, "lan_dns1=%s\n", st->lan_dns1);
+    fprintf(f, "lan_dns2=%s\n", st->lan_dns2);
+    fprintf(f, "lan_dns3=%s\n", st->lan_dns3);
+
+    fclose(f);
+}
+
+static void build_config_change_json(const ConfigState *prev, const ConfigState *cur, char *out, size_t out_size) {
+    int first = 1;
+    char old_esc[512];
+    char new_esc[512];
+    char changes[4096];
+
+    snprintf(out, out_size, "\"config_change\":{\"change_detected\":");
+
+    if (!prev || prev->iface[0] == 0) {
+        strncat(out, "false,\"reason\":\"first_run\",\"changes\":[]}", out_size - strlen(out) - 1);
+        return;
+    }
+
+    changes[0] = 0;
+
+#define ADD_CHANGE(field_name, old_val, new_val) do { \
+    if (strcmp((old_val), (new_val)) != 0) { \
+        json_escape((old_val), old_esc, sizeof(old_esc)); \
+        json_escape((new_val), new_esc, sizeof(new_esc)); \
+        char item[1024]; \
+        snprintf(item, sizeof(item), "%s{\"field\":\"%s\",\"old\":\"%s\",\"new\":\"%s\"}", \
+                 first ? "" : ",", field_name, old_esc, new_esc); \
+        strncat(changes, item, sizeof(changes) - strlen(changes) - 1); \
+        first = 0; \
+    } \
+} while (0)
+
+    ADD_CHANGE("wan_interface", prev->iface, cur->iface);
+    ADD_CHANGE("wan_ip", prev->wan_ip, cur->wan_ip);
+    ADD_CHANGE("gateway", prev->gateway, cur->gateway);
+    ADD_CHANGE("system_dns", prev->system_dns, cur->system_dns);
+
+    ADD_CHANGE("wan_dns1", prev->wan_dns1, cur->wan_dns1);
+    ADD_CHANGE("wan_dns2", prev->wan_dns2, cur->wan_dns2);
+    ADD_CHANGE("active_wan_dns", prev->active_wan_dns, cur->active_wan_dns);
+
+    ADD_CHANGE("lan_dhcp_dns_opt", prev->lan_dhcp_dns_opt, cur->lan_dhcp_dns_opt);
+    ADD_CHANGE("lan_dns1", prev->lan_dns1, cur->lan_dns1);
+    ADD_CHANGE("lan_dns2", prev->lan_dns2, cur->lan_dns2);
+    ADD_CHANGE("lan_dns3", prev->lan_dns3, cur->lan_dns3);
+
+#undef ADD_CHANGE
+
+    if (changes[0] == 0) {
+        strncat(out, "false,\"changes\":[]}", out_size - strlen(out) - 1);
+    } else {
+        strncat(out, "true,\"changes\":[", out_size - strlen(out) - 1);
+        strncat(out, changes, out_size - strlen(out) - 1);
+        strncat(out, "]}", out_size - strlen(out) - 1);
+    }
+}
+
+static void parse_proc_net_tcp_file(const char *path, NetDiag *nd) {
+    FILE *f = fopen(path, "r");
+    char line[512];
+
+    if (!f) return;
+
+    fgets(line, sizeof(line), f);
+
+    while (fgets(line, sizeof(line), f)) {
+        char local[128], rem[128];
+        int sl;
+        unsigned int state;
+
+        if (sscanf(line, "%d: %127s %127s %X", &sl, local, rem, &state) == 4) {
+            nd->tcp_total++;
+
+            switch (state) {
+                case 0x01: nd->tcp_established++; break;
+                case 0x02: nd->tcp_syn_sent++; break;
+                case 0x03: nd->tcp_syn_recv++; break;
+                case 0x06: nd->tcp_time_wait++; break;
+                case 0x08: nd->tcp_close_wait++; break;
+                case 0x0A: nd->tcp_listen++; break;
+            }
+        }
+    }
+
+    fclose(f);
+}
+
+static void parse_proc_net_udp_file(const char *path, NetDiag *nd) {
+    FILE *f = fopen(path, "r");
+    char line[512];
+
+    if (!f) return;
+
+    fgets(line, sizeof(line), f);
+
+    while (fgets(line, sizeof(line), f)) {
+        if (strlen(line) > 10) nd->udp_total++;
+    }
+
+    fclose(f);
+}
+
+static void parse_proc_net_snmp(NetDiag *nd) {
+    FILE *f = fopen("/proc/net/snmp", "r");
+    char header[2048];
+    char values[2048];
+
+    if (!f) return;
+
+    while (fgets(header, sizeof(header), f)) {
+        if (strncmp(header, "Tcp:", 4) == 0) {
+            if (!fgets(values, sizeof(values), f)) break;
+
+            char *h_tokens[128];
+            char *v_tokens[128];
+            int h_count = 0, v_count = 0;
+            char hcopy[2048], vcopy[2048];
+
+            snprintf(hcopy, sizeof(hcopy), "%s", header);
+            snprintf(vcopy, sizeof(vcopy), "%s", values);
+
+            char *tok = strtok(hcopy, " \t\n");
+            while (tok && h_count < 128) {
+                h_tokens[h_count++] = tok;
+                tok = strtok(NULL, " \t\n");
+            }
+
+            tok = strtok(vcopy, " \t\n");
+            while (tok && v_count < 128) {
+                v_tokens[v_count++] = tok;
+                tok = strtok(NULL, " \t\n");
+            }
+
+            for (int i = 1; i < h_count && i < v_count; i++) {
+                long val = atol(v_tokens[i]);
+
+                if (strcmp(h_tokens[i], "CurrEstab") == 0) nd->tcp_curr_estab = val;
+                else if (strcmp(h_tokens[i], "RetransSegs") == 0) nd->tcp_retrans_segs = val;
+                else if (strcmp(h_tokens[i], "ActiveOpens") == 0) nd->tcp_active_opens = val;
+                else if (strcmp(h_tokens[i], "PassiveOpens") == 0) nd->tcp_passive_opens = val;
+                else if (strcmp(h_tokens[i], "AttemptFails") == 0) nd->tcp_attempt_fails = val;
+                else if (strcmp(h_tokens[i], "EstabResets") == 0) nd->tcp_estab_resets = val;
+            }
+        }
+    }
+
+
+    fclose(f);
+}
+
+static long read_long_from_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    long value = 0;
+
+    if (!f) return 0;
+
+    if (fscanf(f, "%ld", &value) != 1) {
+        value = 0;
+    }
+
+    fclose(f);
+    return value;
+}
+
+static int line_contains_token(const char *line, const char *token) {
+    return line && token && strstr(line, token) != NULL;
+}
+
+static int is_private_ipv4(const char *ip) {
+    unsigned int a = 0, b = 0, c = 0, d = 0;
+
+    if (!ip) return 0;
+
+    if (sscanf(ip, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return 0;
+    if (a > 255 || b > 255 || c > 255 || d > 255) return 0;
+
+    if (a == 10) return 1;
+    if (a == 192 && b == 168) return 1;
+    if (a == 172 && b >= 16 && b <= 31) return 1;
+
+    return 0;
+}
+
+static int extract_first_src_ip(const char *line, char *out, size_t out_size) {
+    const char *p;
+    size_t i = 0;
+
+    if (!line || !out || out_size == 0) return 0;
+
+    out[0] = 0;
+    p = strstr(line, "src=");
+
+    if (!p) return 0;
+
+    p += 4;
+
+    while (*p && *p != ' ' && *p != '\t' && i + 1 < out_size) {
+        out[i++] = *p++;
+    }
+
+    out[i] = 0;
+    return out[0] != 0;
+}
+
+typedef struct {
+    char ip[64];
+    long total;
+    long tcp;
+    long udp;
+    long unreplied;
+    long syn_sent;
+} TopLanCounter;
+
+static TopLanCounter *find_or_add_lan_counter(TopLanCounter *items, int *count, int max_items, const char *ip) {
+    if (!items || !count || !ip || ip[0] == 0) return NULL;
+
+    for (int i = 0; i < *count; i++) {
+        if (strcmp(items[i].ip, ip) == 0) return &items[i];
+    }
+
+    if (*count >= max_items) return NULL;
+
+    snprintf(items[*count].ip, sizeof(items[*count].ip), "%s", ip);
+    items[*count].total = 0;
+    items[*count].tcp = 0;
+    items[*count].udp = 0;
+    items[*count].unreplied = 0;
+    items[*count].syn_sent = 0;
+
+    (*count)++;
+    return &items[*count - 1];
+}
+
+static void parse_nf_conntrack(NetDiag *nd) {
+    FILE *f = fopen("/proc/net/nf_conntrack", "r");
+    char line[1024];
+    TopLanCounter lan_items[128];
+    int lan_count = 0;
+
+    memset(lan_items, 0, sizeof(lan_items));
+
+    nd->nf_conntrack_count = read_long_from_file("/proc/sys/net/netfilter/nf_conntrack_count");
+    nd->nf_conntrack_max = read_long_from_file("/proc/sys/net/netfilter/nf_conntrack_max");
+    snprintf(nd->nf_top_lan_ip, sizeof(nd->nf_top_lan_ip), "unknown");
+
+    if (!f) return;
+
+    while (fgets(line, sizeof(line), f)) {
+        int is_tcp = line_contains_token(line, " tcp ");
+        int is_udp = line_contains_token(line, " udp ");
+        int is_icmp = line_contains_token(line, " icmp ");
+        int is_unreplied = line_contains_token(line, "UNREPLIED");
+        int is_syn_sent = line_contains_token(line, "SYN_SENT");
+        char src_ip[64];
+
+        if (is_tcp) nd->nf_tcp_sessions++;
+        if (is_udp) nd->nf_udp_sessions++;
+        if (is_icmp) nd->nf_icmp_sessions++;
+        if (is_unreplied) nd->nf_unreplied++;
+        if (is_syn_sent) nd->nf_syn_sent++;
+
+        if (extract_first_src_ip(line, src_ip, sizeof(src_ip)) && is_private_ipv4(src_ip)) {
+            TopLanCounter *item = find_or_add_lan_counter(lan_items, &lan_count, 128, src_ip);
+
+            if (item) {
+                item->total++;
+                if (is_tcp) item->tcp++;
+                if (is_udp) item->udp++;
+                if (is_unreplied) item->unreplied++;
+                if (is_syn_sent) item->syn_sent++;
+            }
+        }
+    }
+
+    fclose(f);
+
+    for (int i = 0; i < lan_count; i++) {
+        if (lan_items[i].total > nd->nf_top_lan_sessions) {
+            snprintf(nd->nf_top_lan_ip, sizeof(nd->nf_top_lan_ip), "%s", lan_items[i].ip);
+            nd->nf_top_lan_sessions = lan_items[i].total;
+            nd->nf_top_lan_tcp_sessions = lan_items[i].tcp;
+            nd->nf_top_lan_udp_sessions = lan_items[i].udp;
+            nd->nf_top_lan_unreplied = lan_items[i].unreplied;
+            nd->nf_top_lan_syn_sent = lan_items[i].syn_sent;
+        }
+    }
+}
+
+static void get_net_diag(NetDiag *nd) {
+    memset(nd, 0, sizeof(NetDiag));
+
+    parse_proc_net_tcp_file("/proc/net/tcp", nd);
+    parse_proc_net_tcp_file("/proc/net/tcp6", nd);
+    parse_proc_net_udp_file("/proc/net/udp", nd);
+    parse_proc_net_udp_file("/proc/net/udp6", nd);
+    parse_nf_conntrack(nd);
+    parse_proc_net_snmp(nd);
+}
+
+static void run_ping(const char *host, PingResult *res) {
+    char cmd[256];
+    char line[512];
+    FILE *fp;
+    int status;
+
+    memset(res, 0, sizeof(PingResult));
+    res->ok = 0;
+    res->packet_loss = 100;
+    res->avg_ms = -1.0;
+
+    snprintf(cmd, sizeof(cmd), "ping -c 3 -W 2 %s 2>/dev/null", host);
+
+    fp = popen(cmd, "r");
+    if (!fp) return;
+
+    while (fgets(line, sizeof(line), fp)) {
+        char *loss_ptr = strstr(line, "packet loss");
+
+        if (loss_ptr) {
+            char *p = line;
+            while ((p = strchr(p, '%')) != NULL) {
+                char *start = p;
+                while (start > line && *(start - 1) >= '0' && *(start - 1) <= '9') start--;
+                res->packet_loss = atoi(start);
+                break;
+            }
+        }
+
+        if (strstr(line, "min/avg/max") || strstr(line, "round-trip")) {
+            char *eq = strchr(line, '=');
+
+            if (eq) {
+                double minv, avgv, maxv;
+                if (sscanf(eq + 1, "%lf/%lf/%lf", &minv, &avgv, &maxv) == 3) {
+                    res->avg_ms = avgv;
+                }
+            }
+        }
+    }
+
+    status = pclose(fp);
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0 && res->packet_loss < 100) {
+        res->ok = 1;
+    }
+}
+
+static size_t discard_body(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    (void)ptr;
+    (void)userdata;
+    return size * nmemb;
+}
+
+static void apply_curl_common_ssl_options(CURL *curl) {
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+    if (file_exists(CA_BUNDLE)) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, CA_BUNDLE);
+    }
+}
+
+static void run_http_test(const char *name, const char *url, HttpResult *hr) {
+    CURL *curl;
+    CURLcode rc;
+    double namelookup = 0, connect = 0, appconnect = 0, starttransfer = 0, total = 0;
+
+    memset(hr, 0, sizeof(HttpResult));
+
+    snprintf(hr->name, sizeof(hr->name), "%s", name);
+    snprintf(hr->url, sizeof(hr->url), "%s", url);
+
+    curl = curl_easy_init();
+
+    if (!curl) {
+        hr->curl_code = -1;
+        hr->ok = 0;
+        return;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    /*
+     * GET liviano descartando el body.
+     * Evita falsos 405 en sitios como Netflix que pueden rechazar HEAD.
+     */
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discard_body);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, CURL_TIMEOUT_SECONDS);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ontprobe/1.0");
+    apply_curl_common_ssl_options(curl);
+
+    rc = curl_easy_perform(curl);
+
+    hr->curl_code = (int)rc;
+
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &hr->http_code);
+    curl_easy_getinfo(curl, CURLINFO_NAMELOOKUP_TIME, &namelookup);
+    curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME, &connect);
+    curl_easy_getinfo(curl, CURLINFO_APPCONNECT_TIME, &appconnect);
+    curl_easy_getinfo(curl, CURLINFO_STARTTRANSFER_TIME, &starttransfer);
+    curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &total);
+
+    hr->dns_ms = namelookup * 1000.0;
+    hr->tcp_ms = (connect - namelookup) * 1000.0;
+    hr->tls_ms = appconnect > 0 ? (appconnect - connect) * 1000.0 : 0.0;
+    hr->ttfb_ms = starttransfer > 0 ? (starttransfer - appconnect) * 1000.0 : 0.0;
+    hr->total_ms = total * 1000.0;
+
+    if (rc == CURLE_OK && hr->http_code >= 200 && hr->http_code < 400) {
+        hr->ok = 1;
+    } else {
+        hr->ok = 0;
+    }
+
+    curl_easy_cleanup(curl);
+}
+
+static int post_json(const char *url, const char *json, long *http_code_out, int *curl_code_out) {
+    CURL *curl;
+    CURLcode rc;
+    struct curl_slist *headers = NULL;
+    long http_code = 0;
+
+    curl = curl_easy_init();
+
+    if (!curl) return 0;
+
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "User-Agent: ontprobe/1.0");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    apply_curl_common_ssl_options(curl);
+
+    rc = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    if (http_code_out) *http_code_out = http_code;
+    if (curl_code_out) *curl_code_out = (int)rc;
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    return rc == CURLE_OK && http_code >= 200 && http_code < 300;
+}
+
+static void save_pending_json(const char *json) {
+    FILE *in;
+    FILE *out;
+    char lines[MAX_PENDING_LINES][MAX_BUF];
+    int count = 0;
+
+    in = fopen(PENDING_FILE, "r");
+
+    if (in) {
+        char line[MAX_BUF];
+
+        while (fgets(line, sizeof(line), in)) {
+            trim_newline(line);
+
+            if (line[0] == 0) continue;
+
+            if (count < MAX_PENDING_LINES) {
+                snprintf(lines[count], sizeof(lines[count]), "%s", line);
+                count++;
+            }
+        }
+
+        fclose(in);
+    }
+
+    if (count >= MAX_PENDING_LINES) {
+        for (int i = 1; i < count; i++) {
+            snprintf(lines[i - 1], sizeof(lines[i - 1]), "%s", lines[i]);
+        }
+
+        count = MAX_PENDING_LINES - 1;
+    }
+
+    snprintf(lines[count], sizeof(lines[count]), "%s", json);
+    count++;
+
+    out = fopen(PENDING_FILE, "w");
+
+    if (!out) return;
+
+    for (int i = 0; i < count; i++) {
+        fprintf(out, "%s\n", lines[i]);
+    }
+
+    fclose(out);
+}
+
+static void resend_pending(const char *server_url) {
+    FILE *in;
+    FILE *out;
+    char remaining[MAX_PENDING_LINES][MAX_BUF];
+    int remaining_count = 0;
+    char line[MAX_BUF];
+
+    in = fopen(PENDING_FILE, "r");
+
+    if (!in) return;
+
+    while (fgets(line, sizeof(line), in)) {
+        long http_code = 0;
+        int curl_code = 0;
+
+        trim_newline(line);
+
+        if (line[0] == 0) continue;
+
+        if (!post_json(server_url, line, &http_code, &curl_code)) {
+            if (remaining_count < MAX_PENDING_LINES) {
+                snprintf(remaining[remaining_count], sizeof(remaining[remaining_count]), "%s", line);
+                remaining_count++;
+            }
+        }
+    }
+
+    fclose(in);
+
+    if (remaining_count == 0) {
+        unlink(PENDING_FILE);
+        return;
+    }
+
+    out = fopen(PENDING_FILE, "w");
+
+    if (!out) return;
+
+    for (int i = 0; i < remaining_count; i++) {
+        fprintf(out, "%s\n", remaining[i]);
+    }
+
+    fclose(out);
+}
+
+static void get_timestamp(char *out, size_t out_size) {
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+
+    if (!tm_info) {
+        snprintf(out, out_size, "unknown");
+        return;
+    }
+
+    strftime(out, out_size, "%Y-%m-%dT%H:%M:%S", tm_info);
+}
+
+static void classify_result(
+    const ConfigState *cur,
+    const ConfigState *prev,
+    const PingResult *pg,
+    const PingResult *pc,
+    const HttpResult *hrs,
+    int http_count,
+    const NetDiag *nd,
+    char *classification,
+    size_t classification_size,
+    char *reason,
+    size_t reason_size,
+    int *critical_score
+) {
+    int score = 0;
+    int http_failed = 0;
+    int curl7_count = 0;
+    int curl28_count = 0;
+    int curl56_count = 0;
+    int curl6_count = 0;
+
+    reason[0] = 0;
+
+    if (strcmp(cur->wan_ip, "unknown") == 0) {
+        score += 5;
+        strncat(reason, "WAN_IP_UNKNOWN;", reason_size - strlen(reason) - 1);
+    }
+
+    if (strcmp(cur->gateway, "unknown") == 0) {
+        score += 5;
+        strncat(reason, "DEFAULT_GATEWAY_UNKNOWN;", reason_size - strlen(reason) - 1);
+    }
+
+    if (!pg->ok) {
+        score += 1;
+        strncat(reason, "PING_GOOGLE_FAIL;", reason_size - strlen(reason) - 1);
+    }
+
+    if (!pc->ok) {
+        score += 1;
+        strncat(reason, "PING_CLOUDFLARE_FAIL;", reason_size - strlen(reason) - 1);
+    }
+
+    if (pg->packet_loss >= 50 || pc->packet_loss >= 50) {
+        score += 2;
+        strncat(reason, "PING_LOSS_HIGH;", reason_size - strlen(reason) - 1);
+    }
+
+    for (int i = 0; i < http_count; i++) {
+        if (!hrs[i].ok) {
+            http_failed++;
+
+            if (hrs[i].curl_code == 6) curl6_count++;
+            if (hrs[i].curl_code == 7) curl7_count++;
+            if (hrs[i].curl_code == 28) curl28_count++;
+            if (hrs[i].curl_code == 56) curl56_count++;
+        }
+    }
+
+    if (http_failed >= 3) {
+        score += 3;
+        strncat(reason, "MULTIPLE_HTTP_SITES_FAIL;", reason_size - strlen(reason) - 1);
+    } else if (http_failed == 2) {
+        score += 2;
+        strncat(reason, "TWO_HTTP_SITES_FAIL;", reason_size - strlen(reason) - 1);
+    } else if (http_failed == 1) {
+        score += 1;
+        strncat(reason, "ONE_HTTP_SITE_FAIL;", reason_size - strlen(reason) - 1);
+    }
+
+    if (curl6_count >= 2) {
+        score += 3;
+        strncat(reason, "MULTIPLE_CURL_6_DNS_RESOLVE_FAIL;", reason_size - strlen(reason) - 1);
+    }
+
+    if (curl7_count >= 2) {
+        score += 3;
+        strncat(reason, "MULTIPLE_CURL_7_CONNECT_FAIL;", reason_size - strlen(reason) - 1);
+    }
+
+    if (curl28_count >= 2) {
+        score += 3;
+        strncat(reason, "MULTIPLE_CURL_28_TIMEOUT;", reason_size - strlen(reason) - 1);
+    }
+
+    if (curl56_count >= 2) {
+        score += 2;
+        strncat(reason, "MULTIPLE_CURL_56_RECV_FAIL;", reason_size - strlen(reason) - 1);
+    }
+
+    if (nd->tcp_syn_sent > 20) {
+        score += 2;
+        strncat(reason, "HIGH_SYN_SENT;", reason_size - strlen(reason) - 1);
+    }
+
+
+    if (nd->tcp_retrans_segs > 0) {
+        strncat(reason, "TCP_RETRANSMISSIONS_PRESENT;", reason_size - strlen(reason) - 1);
+    }
+
+    if (prev && prev->iface[0] != 0) {
+        if (strcmp(prev->wan_ip, cur->wan_ip) != 0) {
+            score += 1;
+            strncat(reason, "WAN_IP_CHANGED;", reason_size - strlen(reason) - 1);
+        }
+
+        if (strcmp(prev->gateway, cur->gateway) != 0) {
+            score += 1;
+            strncat(reason, "GATEWAY_CHANGED;", reason_size - strlen(reason) - 1);
+        }
+
+        if (strcmp(prev->active_wan_dns, cur->active_wan_dns) != 0) {
+            score += 1;
+            strncat(reason, "ACTIVE_WAN_DNS_CHANGED_LOW_MEDIUM;", reason_size - strlen(reason) - 1);
+        } else if (strcmp(prev->wan_dns1, cur->wan_dns1) != 0 ||
+            strcmp(prev->wan_dns2, cur->wan_dns2) != 0) {
+            score += 1;
+            strncat(reason, "WAN_DNS_CONFIG_CHANGED_LOW_MEDIUM;", reason_size - strlen(reason) - 1);
+        }
+
+        if (strcmp(prev->lan_dns1, cur->lan_dns1) != 0 ||
+            strcmp(prev->lan_dns2, cur->lan_dns2) != 0 ||
+            strcmp(prev->lan_dns3, cur->lan_dns3) != 0) {
+            score += 1;
+            strncat(reason, "LAN_DNS_CHANGED;", reason_size - strlen(reason) - 1);
+        }
+    }
+
+    /*
+     * Si la ONU acaba de iniciar, no eliminamos todo el score,
+     * pero sí reducimos falsos positivos.
+     */
+    if (cur->uptime_seconds > 0 && cur->uptime_seconds < 300) {
+        char boot_reason[128];
+        score -= 2;
+        snprintf(boot_reason, sizeof(boot_reason), "ONU_RECENTLY_BOOTED_UPTIME_%.0f_SECONDS;", cur->uptime_seconds);
+        strncat(reason, boot_reason, reason_size - strlen(reason) - 1);
+    }
+
+    if (score < 0) score = 0;
+
+    if (reason[0] == 0) {
+        snprintf(reason, reason_size, "OK");
+    }
+
+    if (score >= 6) {
+        snprintf(classification, classification_size, "CRITICAL");
+    } else if (score >= 4) {
+        snprintf(classification, classification_size, "BAD");
+    } else if (score >= 2) {
+        snprintf(classification, classification_size, "REGULAR");
+    } else {
+        snprintf(classification, classification_size, "GOOD");
+    }
+
+    *critical_score = score;
+}
+
+static void build_json(
+    char *json,
+    size_t json_size,
+    const char *ont_id,
+    const char *gpon_sn,
+    const char *gpon_model,
+    int attempt,
+    int total_attempts,
+    int interval_seconds,
+    const ConfigState *cur,
+    const char *config_change_json,
+    const NetDiag *nd,
+    const PingResult *ping_google,
+    const PingResult *ping_cloudflare,
+    const HttpResult *http_results,
+    int http_count,
+    const char *classification,
+    const char *reason,
+    int critical_score,
+    const char *delivery
+) {
+    char ts[64];
+    char ont_esc[256], gpon_sn_esc[256], model_esc[256];
+    char iface_esc[128], ip_esc[128], gw_esc[128], system_dns_esc[512];
+    char wan_dns1_esc[128], wan_dns2_esc[128], active_wan_dns_esc[512];
+    char lan_opt_esc[64], lan_dns1_esc[128], lan_dns2_esc[128], lan_dns3_esc[128];
+    char class_esc[64], reason_esc[1024], delivery_esc[64];
+    char top_lan_ip_esc[128];
+
+    get_timestamp(ts, sizeof(ts));
+
+    json_escape(ont_id, ont_esc, sizeof(ont_esc));
+    json_escape(gpon_sn, gpon_sn_esc, sizeof(gpon_sn_esc));
+    json_escape(gpon_model, model_esc, sizeof(model_esc));
+    json_escape(cur->iface, iface_esc, sizeof(iface_esc));
+    json_escape(cur->wan_ip, ip_esc, sizeof(ip_esc));
+    json_escape(cur->gateway, gw_esc, sizeof(gw_esc));
+    json_escape(cur->system_dns, system_dns_esc, sizeof(system_dns_esc));
+
+    json_escape(cur->wan_dns1, wan_dns1_esc, sizeof(wan_dns1_esc));
+    json_escape(cur->wan_dns2, wan_dns2_esc, sizeof(wan_dns2_esc));
+    json_escape(cur->active_wan_dns, active_wan_dns_esc, sizeof(active_wan_dns_esc));
+    json_escape(cur->lan_dhcp_dns_opt, lan_opt_esc, sizeof(lan_opt_esc));
+    json_escape(cur->lan_dns1, lan_dns1_esc, sizeof(lan_dns1_esc));
+    json_escape(cur->lan_dns2, lan_dns2_esc, sizeof(lan_dns2_esc));
+    json_escape(cur->lan_dns3, lan_dns3_esc, sizeof(lan_dns3_esc));
+
+    json_escape(classification, class_esc, sizeof(class_esc));
+    json_escape(reason, reason_esc, sizeof(reason_esc));
+    json_escape(delivery, delivery_esc, sizeof(delivery_esc));
+    json_escape(nd->nf_top_lan_ip, top_lan_ip_esc, sizeof(top_lan_ip_esc));
+
+    snprintf(json, json_size,
+        "{"
+        "\"type\":\"multi_attempt\","
+        "\"agent\":\"ontprobe\","
+        "\"delivery\":\"%s\","
+        "\"timestamp\":\"%s\","
+        "\"ont\":\"%s\","
+        "\"gpon_sn\":\"%s\","
+        "\"model\":\"%s\","
+        "\"attempt\":%d,"
+        "\"total_attempts\":%d,"
+        "\"interval_seconds\":%d,"
+        "\"uptime_seconds\":%.2f,"
+        "\"wan\":{"
+            "\"interface\":\"%s\","
+            "\"ip\":\"%s\","
+            "\"gateway\":\"%s\","
+            "\"system_dns\":\"%s\","
+            "\"dns\":\"%s\","
+            "\"active_wan_dns\":\"%s\","
+            "\"wan_dns1\":\"%s\","
+            "\"wan_dns2\":\"%s\","
+            "\"lan_dhcp_dns_opt\":\"%s\","
+            "\"lan_dns1\":\"%s\","
+            "\"lan_dns2\":\"%s\","
+            "\"lan_dns3\":\"%s\""
+        "},"
+        "\"config_snapshot\":{"
+            "\"wan_interface\":\"%s\","
+            "\"wan_ip\":\"%s\","
+            "\"gateway\":\"%s\","
+            "\"system_dns\":\"%s\","
+            "\"dns\":\"%s\","
+            "\"active_wan_dns\":\"%s\","
+            "\"wan_dns1\":\"%s\","
+            "\"wan_dns2\":\"%s\","
+            "\"lan_dhcp_dns_opt\":\"%s\","
+            "\"lan_dns1\":\"%s\","
+            "\"lan_dns2\":\"%s\","
+            "\"lan_dns3\":\"%s\""
+        "},"
+        "%s,"
+        "\"local_net_diag\":{"
+            "\"tcp_total\":%d,"
+            "\"tcp_established\":%d,"
+            "\"tcp_syn_sent\":%d,"
+            "\"tcp_syn_recv\":%d,"
+            "\"tcp_time_wait\":%d,"
+            "\"tcp_listen\":%d,"
+            "\"tcp_close_wait\":%d,"
+            "\"udp_sockets\":%d,"
+            "\"nf_conntrack_count\":%ld,"
+            "\"nf_conntrack_max\":%ld,"
+            "\"nf_tcp_sessions\":%ld,"
+            "\"nf_udp_sessions\":%ld,"
+            "\"nf_icmp_sessions\":%ld,"
+            "\"nf_unreplied\":%ld,"
+            "\"nf_syn_sent\":%ld,"
+            "\"nf_top_lan_ip\":\"%s\","
+            "\"nf_top_lan_sessions\":%ld,"
+            "\"nf_top_lan_tcp_sessions\":%ld,"
+            "\"nf_top_lan_udp_sessions\":%ld,"
+            "\"nf_top_lan_unreplied\":%ld,"
+            "\"nf_top_lan_syn_sent\":%ld,"
+            "\"tcp_curr_estab\":%ld,"
+            "\"tcp_retrans_segs\":%ld,"
+            "\"tcp_active_opens\":%ld,"
+            "\"tcp_passive_opens\":%ld,"
+            "\"tcp_attempt_fails\":%ld,"
+            "\"tcp_estab_resets\":%ld"
+        "},"
+        "\"ping\":{"
+            "\"google_8_8_8_8\":{\"ok\":%s,\"packet_loss\":%d,\"avg_ms\":%.2f},"
+            "\"cloudflare_1_1_1_1\":{\"ok\":%s,\"packet_loss\":%d,\"avg_ms\":%.2f}"
+        "},"
+        "\"http_tests\":[",
+        delivery_esc,
+        ts,
+        ont_esc,
+        gpon_sn_esc,
+        model_esc,
+        attempt,
+        total_attempts,
+        interval_seconds,
+        cur->uptime_seconds,
+
+        iface_esc,
+        ip_esc,
+        gw_esc,
+        system_dns_esc,
+        active_wan_dns_esc,
+        active_wan_dns_esc,
+        wan_dns1_esc,
+        wan_dns2_esc,
+        lan_opt_esc,
+        lan_dns1_esc,
+        lan_dns2_esc,
+        lan_dns3_esc,
+
+        iface_esc,
+        ip_esc,
+        gw_esc,
+        system_dns_esc,
+        active_wan_dns_esc,
+        active_wan_dns_esc,
+        wan_dns1_esc,
+        wan_dns2_esc,
+        lan_opt_esc,
+        lan_dns1_esc,
+        lan_dns2_esc,
+        lan_dns3_esc,
+
+        config_change_json,
+
+        nd->tcp_total,
+        nd->tcp_established,
+        nd->tcp_syn_sent,
+        nd->tcp_syn_recv,
+        nd->tcp_time_wait,
+        nd->tcp_listen,
+        nd->tcp_close_wait,
+        nd->udp_total,
+        nd->nf_conntrack_count,
+        nd->nf_conntrack_max,
+        nd->nf_tcp_sessions,
+        nd->nf_udp_sessions,
+        nd->nf_icmp_sessions,
+        nd->nf_unreplied,
+        nd->nf_syn_sent,
+        top_lan_ip_esc,
+        nd->nf_top_lan_sessions,
+        nd->nf_top_lan_tcp_sessions,
+        nd->nf_top_lan_udp_sessions,
+        nd->nf_top_lan_unreplied,
+        nd->nf_top_lan_syn_sent,
+        nd->tcp_curr_estab,
+        nd->tcp_retrans_segs,
+        nd->tcp_active_opens,
+        nd->tcp_passive_opens,
+        nd->tcp_attempt_fails,
+        nd->tcp_estab_resets,
+
+        ping_google->ok ? "true" : "false",
+        ping_google->packet_loss,
+        ping_google->avg_ms,
+        ping_cloudflare->ok ? "true" : "false",
+        ping_cloudflare->packet_loss,
+        ping_cloudflare->avg_ms
+    );
+
+    for (int i = 0; i < http_count; i++) {
+        char name_esc[128];
+        char url_esc[512];
+        char item[1024];
+
+        json_escape(http_results[i].name, name_esc, sizeof(name_esc));
+        json_escape(http_results[i].url, url_esc, sizeof(url_esc));
+
+        snprintf(item, sizeof(item),
+            "%s{"
+                "\"name\":\"%s\","
+                "\"url\":\"%s\","
+                "\"ok\":%s,"
+                "\"http_code\":%ld,"
+                "\"curl_code\":%d,"
+                "\"dns_ms\":%.2f,"
+                "\"tcp_ms\":%.2f,"
+                "\"tls_ms\":%.2f,"
+                "\"ttfb_ms\":%.2f,"
+                "\"total_ms\":%.2f"
+            "}",
+            i == 0 ? "" : ",",
+            name_esc,
+            url_esc,
+            http_results[i].ok ? "true" : "false",
+            http_results[i].http_code,
+            http_results[i].curl_code,
+            http_results[i].dns_ms,
+            http_results[i].tcp_ms,
+            http_results[i].tls_ms,
+            http_results[i].ttfb_ms,
+            http_results[i].total_ms
+        );
+
+        strncat(json, item, json_size - strlen(json) - 1);
+    }
+
+    char tail[2048];
+
+    snprintf(tail, sizeof(tail),
+        "],"
+        "\"classification\":\"%s\","
+        "\"critical_score\":%d,"
+        "\"reason\":\"%s\""
+        "}",
+        class_esc,
+        critical_score,
+        reason_esc
+    );
+
+    strncat(json, tail, json_size - strlen(json) - 1);
+}
+
+int main(int argc, char **argv) {
+    const char *server_url;
+    const char *input_ont_id;
+    const char *ont_id;
+    int total_attempts;
+    int interval_seconds;
+
+    char auto_ont_id[128];
+    char gpon_sn[128];
+    char gpon_model[128];
+
+    const char *sites_name[HTTP_SITE_COUNT] = {
+        "google",
+        "cloudflare",
+        "facebook",
+        "netflix",
+        "youtube",
+        "tiktok"
+    };
+
+    const char *sites_url[HTTP_SITE_COUNT] = {
+        "https://www.google.com",
+        "https://www.cloudflare.com",
+        "https://www.facebook.com",
+        "https://www.netflix.com/hn-en/",
+        "https://www.youtube.com",
+        "https://www.tiktok.com"
+    };
+
+    if (argc < 5) {
+        fprintf(stderr, "Uso: %s <SERVER_URL> <TOTAL_ATTEMPTS> <INTERVAL_SECONDS> <ONT_ID>\n", argv[0]);
+        return 1;
+    }
+
+    server_url = argv[1];
+    total_attempts = atoi(argv[2]);
+    interval_seconds = atoi(argv[3]);
+    input_ont_id = argv[4];
+
+    if (total_attempts <= 0) total_attempts = 1;
+    if (interval_seconds <= 0) interval_seconds = 300;
+
+    get_gpon_sn(gpon_sn, sizeof(gpon_sn));
+    get_gpon_model(gpon_model, sizeof(gpon_model));
+
+    if (strcmp(input_ont_id, "AUTO") == 0 || strcmp(input_ont_id, "auto") == 0) {
+        if (strcmp(gpon_sn, "UNKNOWN_GPON_SN") != 0 && strlen(gpon_sn) > 0) {
+            snprintf(auto_ont_id, sizeof(auto_ont_id), "%s", gpon_sn);
+        } else {
+            snprintf(auto_ont_id, sizeof(auto_ont_id), "AUTO_UNKNOWN");
+        }
+
+        ont_id = auto_ont_id;
+    } else {
+        ont_id = input_ont_id;
+    }
+
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    for (int attempt = 1; attempt <= total_attempts; attempt++) {
+        ConfigState cur;
+        ConfigState prev;
+        int has_prev;
+        NetDiag nd;
+        PingResult ping_google;
+        PingResult ping_cloudflare;
+        HttpResult http_results[HTTP_SITE_COUNT];
+        char config_change_json[8192];
+        char classification[64];
+        char reason[2048];
+        char json[MAX_BUF];
+        int critical_score = 0;
+        long post_http = 0;
+        int post_curl = 0;
+        int sent_ok;
+
+        get_current_state(&cur);
+        has_prev = (load_previous_state(&prev) == 0);
+
+        build_config_change_json(has_prev ? &prev : NULL, &cur, config_change_json, sizeof(config_change_json));
+
+        get_net_diag(&nd);
+
+        run_ping("8.8.8.8", &ping_google);
+        run_ping("1.1.1.1", &ping_cloudflare);
+
+        for (int i = 0; i < HTTP_SITE_COUNT; i++) {
+            run_http_test(sites_name[i], sites_url[i], &http_results[i]);
+        }
+
+        classify_result(
+            &cur,
+            has_prev ? &prev : NULL,
+            &ping_google,
+            &ping_cloudflare,
+            http_results,
+            HTTP_SITE_COUNT,
+            &nd,
+            classification,
+            sizeof(classification),
+            reason,
+            sizeof(reason),
+            &critical_score
+        );
+
+        build_json(
+            json,
+            sizeof(json),
+            ont_id,
+            gpon_sn,
+            gpon_model,
+            attempt,
+            total_attempts,
+            interval_seconds,
+            &cur,
+            config_change_json,
+            &nd,
+            &ping_google,
+            &ping_cloudflare,
+            http_results,
+            HTTP_SITE_COUNT,
+            classification,
+            reason,
+            critical_score,
+            "live"
+        );
+
+        sent_ok = post_json(server_url, json, &post_http, &post_curl);
+
+        if (sent_ok) {
+            printf("[OK] Attempt %d/%d enviado. ONT=%s MODEL=%s Estado=%s Score=%d\n",
+                   attempt, total_attempts, ont_id, gpon_model, classification, critical_score);
+
+            resend_pending(server_url);
+        } else {
+            printf("[FAIL] Attempt %d/%d no enviado. curl=%d http=%ld. Guardando pendiente.\n",
+                   attempt, total_attempts, post_curl, post_http);
+
+            save_pending_json(json);
+        }
+
+        save_current_state(&cur);
+
+        if (attempt < total_attempts) {
+            sleep(interval_seconds);
+        }
+    }
+
+    curl_global_cleanup();
+    return 0;
+}
