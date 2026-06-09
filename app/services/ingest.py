@@ -25,7 +25,7 @@ from app.models.ont import Ont
 from app.models.customer import Customer
 from app.models.olt import OLT
 from app.models.telemetry import TelemetryEvent
-from app.services.classifier import classify_telemetry
+from app.services.classifier import classify_telemetry, classify_optical_rx
 from app.core.database import Base, SessionLocal  # for defensive table creation in early hits
 
 logger = logging.getLogger("hyperion.ingest")
@@ -108,6 +108,42 @@ def _extract_ping_averages(payload: Dict[str, Any]) -> tuple[Optional[float], Op
     return _avg(p8), _avg(p1)
 
 
+def _extract_optical(payload: Dict[str, Any]) -> tuple[Optional[float], Optional[float], Optional[str]]:
+    """Extrae rx_power_dbm, tx_power_dbm y optical_status del payload del probe.
+
+    El probe envía:
+      "optical": {"rx_power_dbm": -23.09, "tx_power_dbm": 3.02, "status": "GOOD", ...}
+    También acepta claves directas en el root para compatibilidad futura.
+    """
+    opt = payload.get("optical")
+    if not isinstance(opt, dict):
+        opt = {}
+
+    rx = opt.get("rx_power_dbm")
+    tx = opt.get("tx_power_dbm")
+    status = opt.get("status") or None
+
+    # Fallback a claves de nivel raíz
+    if rx is None:
+        rx = payload.get("rx_power_dbm")
+    if tx is None:
+        tx = payload.get("tx_power_dbm")
+
+    try:
+        rx = float(rx) if rx is not None else None
+    except Exception:
+        rx = None
+    try:
+        tx = float(tx) if tx is not None else None
+    except Exception:
+        tx = None
+
+    if status not in ("GOOD", "WARNING", "CRITICAL", "UNKNOWN"):
+        status = None
+
+    return rx, tx, status
+
+
 def _extract_tcp_retrans(payload: Dict[str, Any]) -> Optional[int]:
     local = payload.get("local_net_diag") or {}
     if isinstance(local, dict):
@@ -138,6 +174,7 @@ def parse_probe_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     curr_cfg = _extract_current_config(payload)
     ping8, ping1 = _extract_ping_averages(payload)
     tcp_retrans = _extract_tcp_retrans(payload)
+    rx_dbm, tx_dbm, optical_status_probe = _extract_optical(payload)
 
     uptime = 0.0
     try:
@@ -156,6 +193,9 @@ def parse_probe_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "ping_8_avg": ping8,
         "ping_1_avg": ping1,
         "tcp_retrans_segs": tcp_retrans,
+        "rx_power_dbm": rx_dbm,
+        "tx_power_dbm": tx_dbm,
+        "optical_status_probe": optical_status_probe,
         "uptime_seconds": uptime,
         "classification": classification,
         "reason": reason,
@@ -262,6 +302,9 @@ def process_telemetry_event(
     ping8 = parsed["ping_8_avg"]
     ping1 = parsed["ping_1_avg"]
     tcp_retrans = parsed["tcp_retrans_segs"]
+    rx_dbm = parsed["rx_power_dbm"]
+    tx_dbm = parsed["tx_power_dbm"]
+    optical_status_probe = parsed["optical_status_probe"]
     uptime = parsed["uptime_seconds"]
     probe_cls = parsed["classification"]
     probe_reason = parsed["reason"]
@@ -325,7 +368,21 @@ def process_telemetry_event(
     classification, reason = _detect_config_drift(db, ont, curr_cfg, classification, reason)
     classification, reason = _maybe_downgrade_for_low_uptime(classification, reason, uptime)
 
-    # 5. Persist event
+    # 5. Clasificación óptica (siempre calculada en servidor; se prefiere la del probe si es válida)
+    optical_cls, optical_reason_str = classify_optical_rx(rx_dbm)
+    optical_status = optical_status_probe if optical_status_probe else optical_cls
+
+    # Integración óptica → impacto sobre clasificación principal
+    if optical_status == "CRITICAL" and rx_dbm is not None:
+        if classification in ("GOOD", "REGULAR"):
+            classification = "BAD"
+        reason = (reason or "") + f" | OPTICAL_CRITICAL: RX={rx_dbm:.2f} dBm"
+    elif optical_status == "WARNING" and rx_dbm is not None:
+        if classification == "GOOD":
+            classification = "REGULAR"
+        reason = (reason or "") + f" | OPTICAL_WARNING: RX={rx_dbm:.2f} dBm"
+
+    # 6. Persist event
     event = TelemetryEvent(
         ont_id=ont.id,
         classification=classification,
@@ -334,6 +391,9 @@ def process_telemetry_event(
         ping_8_avg=ping8,
         ping_1_avg=ping1,
         tcp_retrans_segs=tcp_retrans,
+        rx_power_dbm=rx_dbm,
+        tx_power_dbm=tx_dbm,
+        optical_status=optical_status,
         data=raw,
         delivery=delivery,
     )

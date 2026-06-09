@@ -143,6 +143,15 @@ typedef struct {
     double avg_ms;
 } PingResult;
 
+typedef struct {
+    int rx_ok;
+    int tx_ok;
+    double rx_dbm;
+    double tx_dbm;
+    char status[32];
+    char reason[128];
+} OpticalInfo;
+
 static void trim_newline(char *s) {
     if (!s) return;
 
@@ -233,8 +242,40 @@ static void get_gpon_model(char *out, size_t out_size) {
     get_flash_value("GPON_ONU_MODEL", "GPON_ONU_MODEL=", out, out_size, "UNKNOWN_MODEL");
 }
 
+static int is_ipv4_token(const char *s) {
+    unsigned int a = 0, b = 0, c = 0, d = 0;
+    char extra = 0;
+
+    if (!s || !*s) return 0;
+
+    if (sscanf(s, "%u.%u.%u.%u%c", &a, &b, &c, &d, &extra) != 4) {
+        return 0;
+    }
+
+    return a <= 255 && b <= 255 && c <= 255 && d <= 255;
+}
+
+static int dns_list_contains(const char *dns, const char *ns) {
+    char copy[256];
+    char *tok;
+
+    if (!dns || !ns || dns[0] == 0 || ns[0] == 0) return 0;
+
+    snprintf(copy, sizeof(copy), "%s", dns);
+
+    tok = strtok(copy, ",");
+    while (tok) {
+        if (strcmp(tok, ns) == 0) return 1;
+        tok = strtok(NULL, ",");
+    }
+
+    return 0;
+}
+
 static void append_dns(char *dns, size_t dns_size, const char *ns) {
     if (!dns || !ns || ns[0] == 0) return;
+    if (!is_ipv4_token(ns)) return;
+    if (dns_list_contains(dns, ns)) return;
 
     if (strlen(dns) + strlen(ns) + 2 < dns_size) {
         if (strlen(dns) > 0) strcat(dns, ",");
@@ -242,36 +283,152 @@ static void append_dns(char *dns, size_t dns_size, const char *ns) {
     }
 }
 
-static void get_active_wan_dns_from_dnsmasq(ConfigState *st) {
-    FILE *f = fopen("/var/dnsmas.conf", "r");
-    char line[256];
+static void clean_dnsmasq_server_token(char *s) {
+    char *at;
 
-    st->active_wan_dns[0] = 0;
+    if (!s) return;
 
-    if (!f) {
-        snprintf(st->active_wan_dns, sizeof(st->active_wan_dns), "unknown");
-        return;
+    trim_newline(s);
+
+    /*
+     * dnsmasq puede venir como:
+     *   server=8.8.8.8@nas0_0
+     *   server=//8.8.8.8@10.140.86.77
+     *   server=/dominio/190.92.0.5@nas0_0
+     *
+     * Nos quedamos con el último token después de '/'.
+     */
+    while (s[0] == '/') {
+        memmove(s, s + 1, strlen(s));
     }
 
+    at = strrchr(s, '/');
+    if (at && *(at + 1) != 0) {
+        memmove(s, at + 1, strlen(at));
+    }
+
+    s[strcspn(s, "\r\n \t/@")] = 0;
+}
+
+static int bind_matches_wan(const char *bind, const ConfigState *st) {
+    if (!bind || !st || bind[0] == 0) return 0;
+
+    if (strcmp(bind, st->iface) == 0) return 1;
+    if (strstr(bind, "nas") == bind) return 1;
+
+    /*
+     * Algunas ONUs no usan @nas0_0, sino @WAN_IP:
+     *   server=190.92.0.5@10.140.86.77
+     */
+    if (strcmp(st->wan_ip, "unknown") != 0 && strcmp(bind, st->wan_ip) == 0) return 1;
+
+    return 0;
+}
+
+static int read_dnsmasq_file(const char *path, ConfigState *st) {
+    FILE *f = fopen(path, "r");
+    char line[512];
+    int found = 0;
+
+    if (!f) return 0;
+
     while (fgets(line, sizeof(line), f)) {
-        char dns_ip[64];
-        char ifname[64];
+        char dns_ip[128];
+        char bind[128];
+        char *p;
+        char *at;
 
         trim_newline(line);
 
-        /*
-         * Ejemplo real:
-         *   server=8.8.8.8@nas0_0
-         *   server=1.1.1.1@nas0_0
-         */
-        if (sscanf(line, "server=%63[^@]@%63s", dns_ip, ifname) == 2) {
-            if (strcmp(ifname, "nas0_0") == 0 || strstr(ifname, "nas") == ifname) {
-                append_dns(st->active_wan_dns, sizeof(st->active_wan_dns), dns_ip);
-            }
+        if (strncmp(line, "server=", 7) != 0) {
+            continue;
+        }
+
+        p = line + 7;
+        at = strrchr(p, '@');
+
+        if (!at) {
+            continue;
+        }
+
+        *at = 0;
+        snprintf(bind, sizeof(bind), "%s", at + 1);
+        bind[strcspn(bind, "\r\n \t")] = 0;
+
+        if (!bind_matches_wan(bind, st)) {
+            continue;
+        }
+
+        snprintf(dns_ip, sizeof(dns_ip), "%s", p);
+        clean_dnsmasq_server_token(dns_ip);
+
+        if (is_ipv4_token(dns_ip)) {
+            append_dns(st->active_wan_dns, sizeof(st->active_wan_dns), dns_ip);
+            found = 1;
         }
     }
 
     fclose(f);
+    return found;
+}
+
+static int read_resolv_backup_file(const char *path, ConfigState *st) {
+    FILE *f = fopen(path, "r");
+    char line[256];
+    int found = 0;
+
+    if (!f) return 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        char dns_ip[128];
+
+        trim_newline(line);
+
+        if (sscanf(line, "nameserver %127s", dns_ip) == 1) {
+            dns_ip[strcspn(dns_ip, "\r\n \t")] = 0;
+        } else {
+            snprintf(dns_ip, sizeof(dns_ip), "%s", line);
+            dns_ip[strcspn(dns_ip, "\r\n \t")] = 0;
+        }
+
+        if (is_ipv4_token(dns_ip)) {
+            append_dns(st->active_wan_dns, sizeof(st->active_wan_dns), dns_ip);
+            found = 1;
+        }
+    }
+
+    fclose(f);
+    return found;
+}
+
+static void get_active_wan_dns_from_dnsmasq(ConfigState *st) {
+    st->active_wan_dns[0] = 0;
+
+    /*
+     * Firmware 1 puerto:
+     *   /var/dnsmasq.conf -> server=1.1.1.1@nas0_0
+     *
+     * Firmware 4 antenas:
+     *   /var/dnsmasq.conf -> server=190.92.0.5@10.140.86.77
+     *
+     * Algunos firmwares usan el nombre viejo /var/dnsmas.conf.
+     */
+    read_dnsmasq_file("/var/dnsmasq.conf", st);
+    read_dnsmasq_file("/var/dnsmas.conf", st);
+
+    /*
+     * Fallback observado en algunas ONUs:
+     *   resolv_backup.conf
+     *   8.8.8.8
+     *   1.1.1.1
+     */
+    if (st->active_wan_dns[0] == 0) {
+        read_resolv_backup_file("/var/resolv_backup.conf", st);
+        read_resolv_backup_file("/etc/resolv_backup.conf", st);
+        read_resolv_backup_file("/tmp/resolv_backup.conf", st);
+        read_resolv_backup_file("/etc/scripts/resolv_backup.conf", st);
+        read_resolv_backup_file("/resolv_backup.conf", st);
+    }
 
     if (st->active_wan_dns[0] == 0) {
         snprintf(st->active_wan_dns, sizeof(st->active_wan_dns), "unknown");
@@ -1037,6 +1194,131 @@ static void resend_pending(const char *server_url) {
     fclose(out);
 }
 
+
+static int read_cli_double_value(const char *cmd, const char *key, double *value) {
+    FILE *fp;
+    char line[256];
+
+    if (!cmd || !key || !value) return 0;
+
+    fp = popen(cmd, "r");
+    if (!fp) return 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = strstr(line, key);
+
+        if (p) {
+            p = strchr(p, ':');
+            if (p) {
+                *value = atof(p + 1);
+                pclose(fp);
+                return 1;
+            }
+        }
+    }
+
+    pclose(fp);
+    return 0;
+}
+
+static void classify_optical_rx(OpticalInfo *opt) {
+    if (!opt) return;
+
+    if (!opt->rx_ok) {
+        snprintf(opt->status, sizeof(opt->status), "UNKNOWN");
+        snprintf(opt->reason, sizeof(opt->reason), "RX_POWER_NOT_READ");
+        return;
+    }
+
+    /*
+     * Rangos operativos definidos para campo:
+     *   GOOD     : -17 dBm a -24 dBm
+     *   WARNING  : < -24 dBm hasta >= -27 dBm
+     *   CRITICAL : > -17 dBm o < -27 dBm
+     */
+    if (opt->rx_dbm > -17.0) {
+        snprintf(opt->status, sizeof(opt->status), "CRITICAL");
+        snprintf(opt->reason, sizeof(opt->reason), "RX_POWER_TOO_HIGH");
+    } else if (opt->rx_dbm >= -24.0) {
+        snprintf(opt->status, sizeof(opt->status), "GOOD");
+        snprintf(opt->reason, sizeof(opt->reason), "RX_POWER_NORMAL");
+    } else if (opt->rx_dbm >= -27.0) {
+        snprintf(opt->status, sizeof(opt->status), "WARNING");
+        snprintf(opt->reason, sizeof(opt->reason), "RX_POWER_LOW_WARNING");
+    } else {
+        snprintf(opt->status, sizeof(opt->status), "CRITICAL");
+        snprintf(opt->reason, sizeof(opt->reason), "RX_POWER_LOW_CRITICAL");
+    }
+}
+
+static void get_optical_info(OpticalInfo *opt) {
+    if (!opt) return;
+
+    memset(opt, 0, sizeof(OpticalInfo));
+    opt->rx_dbm = -999.0;
+    opt->tx_dbm = -999.0;
+    snprintf(opt->status, sizeof(opt->status), "UNKNOWN");
+    snprintf(opt->reason, sizeof(opt->reason), "NOT_READ");
+
+    opt->rx_ok = read_cli_double_value(
+        "printf 'laser power --rxread\nexit\n' | cli 2>/dev/null",
+        "RxPower_dBm",
+        &opt->rx_dbm
+    );
+
+    opt->tx_ok = read_cli_double_value(
+        "printf 'laser power --txread\nexit\n' | cli 2>/dev/null",
+        "TxPower_dBm",
+        &opt->tx_dbm
+    );
+
+    classify_optical_rx(opt);
+}
+
+static void build_optical_json(const OpticalInfo *opt, char *out, size_t out_size) {
+    char status_esc[64];
+    char reason_esc[256];
+    char rx_value[64];
+    char tx_value[64];
+
+    if (!out || out_size == 0) return;
+
+    if (!opt) {
+        snprintf(out, out_size,
+            "\"optical\":{\"rx_read_ok\":false,\"tx_read_ok\":false,"
+            "\"rx_power_dbm\":null,\"tx_power_dbm\":null,"
+            "\"status\":\"UNKNOWN\",\"reason\":\"NO_OPTICAL_INFO\"}"
+        );
+        return;
+    }
+
+    json_escape(opt->status, status_esc, sizeof(status_esc));
+    json_escape(opt->reason, reason_esc, sizeof(reason_esc));
+
+    if (opt->rx_ok) snprintf(rx_value, sizeof(rx_value), "%.6f", opt->rx_dbm);
+    else snprintf(rx_value, sizeof(rx_value), "null");
+
+    if (opt->tx_ok) snprintf(tx_value, sizeof(tx_value), "%.6f", opt->tx_dbm);
+    else snprintf(tx_value, sizeof(tx_value), "null");
+
+    snprintf(out, out_size,
+        "\"optical\":{"
+            "\"rx_read_ok\":%s,"
+            "\"tx_read_ok\":%s,"
+            "\"rx_power_dbm\":%s,"
+            "\"tx_power_dbm\":%s,"
+            "\"status\":\"%s\","
+            "\"reason\":\"%s\""
+        "}",
+        opt->rx_ok ? "true" : "false",
+        opt->tx_ok ? "true" : "false",
+        rx_value,
+        tx_value,
+        status_esc,
+        reason_esc
+    );
+}
+
 static void get_timestamp(char *out, size_t out_size) {
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
@@ -1217,6 +1499,7 @@ static void build_json(
     int total_attempts,
     int interval_seconds,
     const ConfigState *cur,
+    const OpticalInfo *optical,
     const char *config_change_json,
     const NetDiag *nd,
     const PingResult *ping_google,
@@ -1235,6 +1518,7 @@ static void build_json(
     char lan_opt_esc[64], lan_dns1_esc[128], lan_dns2_esc[128], lan_dns3_esc[128];
     char class_esc[64], reason_esc[1024], delivery_esc[64];
     char top_lan_ip_esc[128];
+    char optical_json[512];
 
     get_timestamp(ts, sizeof(ts));
 
@@ -1258,6 +1542,7 @@ static void build_json(
     json_escape(reason, reason_esc, sizeof(reason_esc));
     json_escape(delivery, delivery_esc, sizeof(delivery_esc));
     json_escape(nd->nf_top_lan_ip, top_lan_ip_esc, sizeof(top_lan_ip_esc));
+    build_optical_json(optical, optical_json, sizeof(optical_json));
 
     snprintf(json, json_size,
         "{"
@@ -1272,6 +1557,7 @@ static void build_json(
         "\"total_attempts\":%d,"
         "\"interval_seconds\":%d,"
         "\"uptime_seconds\":%.2f,"
+        "%s,"
         "\"wan\":{"
             "\"interface\":\"%s\","
             "\"ip\":\"%s\","
@@ -1344,6 +1630,7 @@ static void build_json(
         total_attempts,
         interval_seconds,
         cur->uptime_seconds,
+        optical_json,
 
         iface_esc,
         ip_esc,
@@ -1526,6 +1813,7 @@ int main(int argc, char **argv) {
         ConfigState prev;
         int has_prev;
         NetDiag nd;
+        OpticalInfo optical;
         PingResult ping_google;
         PingResult ping_cloudflare;
         HttpResult http_results[HTTP_SITE_COUNT];
@@ -1544,6 +1832,7 @@ int main(int argc, char **argv) {
         build_config_change_json(has_prev ? &prev : NULL, &cur, config_change_json, sizeof(config_change_json));
 
         get_net_diag(&nd);
+        get_optical_info(&optical);
 
         run_ping("8.8.8.8", &ping_google);
         run_ping("1.1.1.1", &ping_cloudflare);
@@ -1577,6 +1866,7 @@ int main(int argc, char **argv) {
             total_attempts,
             interval_seconds,
             &cur,
+            &optical,
             config_change_json,
             &nd,
             &ping_google,

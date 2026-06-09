@@ -526,6 +526,25 @@
                 </div>
             </div>
 
+            <!-- Señal Óptica GPON -->
+            <div class="mb-4 bg-slate-950 border border-cyan-900/40 rounded-2xl p-3 text-xs">
+                <div class="section-header text-cyan-400 mb-2">Señal Óptica GPON (última lectura)</div>
+                <div class="flex items-center flex-wrap gap-x-6 gap-y-2">
+                    <div>
+                        <span class="text-slate-400">RX: </span>
+                        <span id="detail-rx-power" class="font-mono font-semibold text-slate-400">—</span>
+                        <span class="text-slate-500"> dBm</span>
+                    </div>
+                    <div>
+                        <span class="text-slate-400">TX: </span>
+                        <span id="detail-tx-power" class="font-mono font-semibold text-blue-300">—</span>
+                        <span class="text-slate-500"> dBm</span>
+                    </div>
+                    <div id="detail-optical-badge"></div>
+                </div>
+                <div class="text-[10px] text-slate-600 mt-1.5">GOOD: -17 a -24 dBm &nbsp;|&nbsp; WARNING: -24 a -27 dBm &nbsp;|&nbsp; CRITICAL: &gt;-17 o &lt;-27 dBm</div>
+            </div>
+
             <div class="text-xs text-slate-400 mb-3">Datos del probe: wan_ip, model, last_seen actualizados en cada POST /ont-monitor. Nuevas métricas conntrack desde v Conntrack Analytics.</div>
 
             <!-- Generar grafica DENTRO del detalle del cliente/ONT -->
@@ -1002,6 +1021,42 @@
                     card.innerHTML = `<div class="text-teal-300 text-[10px] font-semibold mb-1">TOP TALKER ANÓMALO (${summary.top_talker_issues.length})</div>` + lines;
                     grid.appendChild(card);
                 }
+                // === Alertas ópticas GPON ===
+                if (summary.optical_critical && summary.optical_critical.length) {
+                    count += summary.optical_critical.length;
+                    const card = document.createElement('div');
+                    card.className = 'alert-card bg-red-900/20 border border-red-400/40 p-3 rounded-3xl cursor-pointer hover:border-red-300 overflow-hidden';
+                    card.onclick = () => {
+                        const first = summary.optical_critical[0];
+                        if (first && first.gpon) showOntDetail(first.gpon);
+                        else showAlertsDetail('optical_critical', summary.optical_critical, 'Señal Óptica CRITICAL');
+                    };
+                    const lines = summary.optical_critical.slice(0,8).map(o => {
+                        const rx = o.rx_power_dbm != null ? `${o.rx_power_dbm.toFixed(2)} dBm` : '?';
+                        const cust = o.customer ? ` <span class="text-slate-400">${o.customer}</span>` : '';
+                        return `<div class="text-[10px] font-mono flex justify-between"><span class="text-red-300">${o.gpon}${cust}</span><span class="text-red-400 font-semibold">RX ${rx}</span></div>`;
+                    }).join('');
+                    card.innerHTML = `<div class="text-red-300 text-[10px] font-semibold mb-1">🔴 ÓPTICA CRITICAL (${summary.optical_critical.length})</div>` + lines;
+                    grid.appendChild(card);
+                }
+                if (summary.optical_warning && summary.optical_warning.length) {
+                    count += summary.optical_warning.length;
+                    const card = document.createElement('div');
+                    card.className = 'alert-card bg-amber-900/20 border border-amber-400/40 p-3 rounded-3xl cursor-pointer hover:border-amber-300 overflow-hidden';
+                    card.onclick = () => {
+                        const first = summary.optical_warning[0];
+                        if (first && first.gpon) showOntDetail(first.gpon);
+                        else showAlertsDetail('optical_warning', summary.optical_warning, 'Señal Óptica WARNING');
+                    };
+                    const lines = summary.optical_warning.slice(0,8).map(o => {
+                        const rx = o.rx_power_dbm != null ? `${o.rx_power_dbm.toFixed(2)} dBm` : '?';
+                        const cust = o.customer ? ` <span class="text-slate-400">${o.customer}</span>` : '';
+                        return `<div class="text-[10px] font-mono flex justify-between"><span class="text-amber-300">${o.gpon}${cust}</span><span class="text-amber-400 font-semibold">RX ${rx}</span></div>`;
+                    }).join('');
+                    card.innerHTML = `<div class="text-amber-300 text-[10px] font-semibold mb-1">⚠ ÓPTICA WARNING (${summary.optical_warning.length})</div>` + lines;
+                    grid.appendChild(card);
+                }
+
                 if (count === 0) {
                     grid.innerHTML = `<div class="col-span-3 bg-emerald-900/10 border border-emerald-600/30 p-4 rounded-3xl text-emerald-300 text-sm flex items-center gap-x-2"><i class="fa-regular fa-check-circle"></i> <span>Sin alertas activas. Todo estable.</span></div>`;
                 }
@@ -1644,6 +1699,10 @@
             document.getElementById('detail-nf-top-tcp').textContent = '—';
             document.getElementById('detail-nf-top-unr').textContent = '—';
             document.getElementById('detail-nf-top-syn').textContent = '—';
+            document.getElementById('detail-rx-power').textContent = '—';
+            document.getElementById('detail-rx-power').className = 'font-mono font-semibold text-slate-400';
+            document.getElementById('detail-tx-power').textContent = '—';
+            document.getElementById('detail-optical-badge').innerHTML = '';
             modal.classList.remove('hidden'); modal.classList.add('flex');
 
             loadOntDetailData(gpon_sn);
@@ -1791,6 +1850,53 @@
                     const ttEl = document.getElementById('detail-nf-top-tcp'); if (ttEl) ttEl.textContent = topT;
                     const tuEl = document.getElementById('detail-nf-top-unr'); if (tuEl) tuEl.textContent = topUn;
                     const tsyEl = document.getElementById('detail-nf-top-syn'); if (tsyEl) tsyEl.textContent = topSy;
+
+                    // === Señal óptica GPON ===
+                    const rxVal = latest.rx_power_dbm != null ? latest.rx_power_dbm
+                                : (d.optical ? d.optical.rx_power_dbm : null);
+                    const txVal = latest.tx_power_dbm != null ? latest.tx_power_dbm
+                                : (d.optical ? d.optical.tx_power_dbm : null);
+                    const optStatus = latest.optical_status
+                                   || (d.optical ? d.optical.status : null)
+                                   || 'UNKNOWN';
+
+                    const rxEl = document.getElementById('detail-rx-power');
+                    const txEl2 = document.getElementById('detail-tx-power');
+                    const optBadge = document.getElementById('detail-optical-badge');
+
+                    if (rxEl) {
+                        if (rxVal != null) {
+                            let rxCls = 'font-mono font-semibold text-emerald-400';
+                            if (rxVal > -17 || rxVal < -27) rxCls = 'font-mono font-semibold text-red-400';
+                            else if (rxVal < -24) rxCls = 'font-mono font-semibold text-amber-400';
+                            rxEl.className = rxCls;
+                            rxEl.textContent = rxVal.toFixed(2);
+                        } else {
+                            rxEl.className = 'font-mono font-semibold text-slate-500';
+                            rxEl.textContent = '— (probe no reportó)';
+                        }
+                    }
+                    if (txEl2) {
+                        if (txVal != null) {
+                            txEl2.className = 'font-mono font-semibold text-blue-300';
+                            txEl2.textContent = txVal.toFixed(2);
+                        } else {
+                            txEl2.className = 'font-mono font-semibold text-slate-500';
+                            txEl2.textContent = '—';
+                        }
+                    }
+                    if (optBadge) {
+                        if (optStatus === 'GOOD')
+                            optBadge.innerHTML = '<span class="px-2 py-0.5 rounded-full bg-emerald-700 text-white text-[10px] font-semibold">GOOD</span>';
+                        else if (optStatus === 'WARNING')
+                            optBadge.innerHTML = '<span class="px-2 py-0.5 rounded-full bg-amber-500 text-black text-[10px] font-semibold">⚠ WARNING</span>';
+                        else if (optStatus === 'CRITICAL')
+                            optBadge.innerHTML = '<span class="px-2 py-0.5 rounded-full bg-red-600 text-white text-[10px] font-semibold">🔴 CRITICAL</span>';
+                        else if (rxVal == null)
+                            optBadge.innerHTML = '<span class="px-2 py-0.5 rounded-full bg-slate-700 text-slate-400 text-[10px]">SIN LECTURA</span>';
+                        else
+                            optBadge.innerHTML = '<span class="px-2 py-0.5 rounded-full bg-slate-600 text-slate-300 text-[10px]">UNKNOWN</span>';
+                    }
                 } else {
                     badge.innerHTML = '<span class="bg-slate-600 px-3 py-0.5 rounded-full">SIN EVENTOS</span>';
                     reasonEl.textContent = 'Aún no hay TelemetryEvent para este gpon_sn. Envía datos desde la ONU.';
@@ -1849,6 +1955,14 @@
                     let html = '';
                     if (type === 'olt_downs') {
                         html = `<div><span class="text-red-400">OLT:</span> ${item.name} <span class="text-slate-400">(${item.ip})</span> last_ping:${item.last_ping || '-'}</div>`;
+                    } else if (type === 'optical_critical' || type === 'optical_warning') {
+                        const rxStr = item.rx_power_dbm != null ? `${item.rx_power_dbm.toFixed(2)} dBm` : '—';
+                        const txStr = item.tx_power_dbm != null ? `${item.tx_power_dbm.toFixed(2)} dBm` : '—';
+                        const rxCls = type === 'optical_critical' ? 'text-red-400' : 'text-amber-400';
+                        const custStr = item.customer ? ` | Cliente: <span class="text-slate-300">${item.customer}</span>` : '';
+                        html = `<div><span class="${rxCls}">${item.gpon}</span>${custStr}</div>`
+                             + `<div class="text-[10px] mt-0.5">RX: <span class="${rxCls} font-semibold">${rxStr}</span> &nbsp; TX: <span class="text-blue-300">${txStr}</span></div>`
+                             + `<div class="text-[10px] text-slate-400 mt-0.5">${item.ts ? formatTs(item.ts) : ''}</div>`;
                     } else if (type === 'critical_onus' || type === 'config_changes' || type === 'mass_client_outages' || type === 'high_conntrack' || type === 'high_unreplied' || type === 'high_syn_sent' || type === 'top_talker_issues') {
                         html = `<div><span class="text-rose-400">${item.gpon || item.olt_name || ''}</span> — ${ (item.reason || item.olt_name || '').substring(0,100) }</div><div class="text-[10px] text-slate-400 mt-0.5">${item.ts ? formatTs(item.ts) : ''}</div>`;
                     } else {

@@ -12,7 +12,27 @@ Rules (kept faithful to original intent):
 - Packet loss and high latency on primary DNS have highest severity.
 """
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
+
+
+def classify_optical_rx(rx_dbm: Optional[float]) -> Tuple[str, str]:
+    """
+    Clasifica la potencia óptica RX de la ONU.
+
+    Rangos operativos:
+      GOOD:     -17 dBm a -24 dBm  (señal normal)
+      WARNING:  < -24 dBm y >= -27 dBm  (señal baja, monitorear)
+      CRITICAL: > -17 dBm o < -27 dBm   (reflexión o fibra muy degradada)
+    """
+    if rx_dbm is None:
+        return "UNKNOWN", "RX_POWER_NOT_READ"
+    if rx_dbm > -17.0:
+        return "CRITICAL", f"RX_TOO_HIGH ({rx_dbm:.2f} dBm > -17 dBm, posible reflexión)"
+    if rx_dbm >= -24.0:
+        return "GOOD", f"RX_NORMAL ({rx_dbm:.2f} dBm)"
+    if rx_dbm >= -27.0:
+        return "WARNING", f"RX_LOW_WARNING ({rx_dbm:.2f} dBm, fibra degradada)"
+    return "CRITICAL", f"RX_TOO_LOW ({rx_dbm:.2f} dBm < -27 dBm, corte inminente)"
 
 
 def classify_telemetry(data: Dict[str, Any]) -> Tuple[str, str | None]:

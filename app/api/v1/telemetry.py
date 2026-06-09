@@ -7,6 +7,7 @@ from app.core.database import get_db
 from app.models.ont import Ont
 from app.models.telemetry import TelemetryEvent
 from app.models.olt import OLT
+from app.models.customer import Customer
 from app.models.ping_log import PingLog
 from app.core.security import get_current_active_technician
 # SINGLE SOURCE OF TRUTH for classification (extracted for long-term maintainability)
@@ -436,6 +437,41 @@ def alerts_summary(
                 top_talker.append(alert)
             seen.add(ev.ont.gpon_sn)
 
+    # === Alertas ópticas (RX/TX power de última lectura por ONT en las últimas 30 min) ===
+    optical_critical = []
+    optical_warning = []
+    seen_optical = set()
+    for ev in db.query(TelemetryEvent).filter(
+        TelemetryEvent.received_at >= recent,
+        TelemetryEvent.optical_status.in_(["WARNING", "CRITICAL"])
+    ).order_by(TelemetryEvent.received_at.desc()).all():
+        if not ev.ont or ev.ont.gpon_sn in seen_optical:
+            continue
+        seen_optical.add(ev.ont.gpon_sn)
+        item = {
+            "gpon": ev.ont.gpon_sn,
+            "rx_power_dbm": ev.rx_power_dbm,
+            "tx_power_dbm": ev.tx_power_dbm,
+            "optical_status": ev.optical_status,
+            "reason": f"RX={ev.rx_power_dbm:.2f} dBm" if ev.rx_power_dbm is not None else "sin lectura",
+            "ts": ev.received_at.isoformat(),
+            "mac": ev.ont.mac_address,
+            "ip": ev.ont.ip_address or ev.wan_ip,
+            "uptime_seconds": (ev.data or {}).get("uptime_seconds") if ev.data else None,
+            "customer": None,
+        }
+        try:
+            if ev.ont.customer_id:
+                cust = db.get(Customer, ev.ont.customer_id)
+                if cust:
+                    item["customer"] = cust.name
+        except Exception:
+            pass
+        if ev.optical_status == "CRITICAL":
+            optical_critical.append(item)
+        else:
+            optical_warning.append(item)
+
     return {
         "olt_downs": [{"id": o.id, "name": o.name, "ip": o.ip_address, "last_ping": o.last_ping_ms} for o in down_olts],
         "mass_client_outages": mass_impacted[:limit],
@@ -445,6 +481,8 @@ def alerts_summary(
         "high_unreplied": unreplied_high[:limit],
         "high_syn_sent": syn_high[:limit],
         "top_talker_issues": top_talker[:limit],
+        "optical_critical": optical_critical[:limit],
+        "optical_warning": optical_warning[:limit],
         "generated_at": now.isoformat(),
     }
 
@@ -484,8 +522,11 @@ def get_recent_telemetry(
             "ping_8_avg": e.ping_8_avg,
             "ping_1_avg": e.ping_1_avg,
             "tcp_retrans_segs": e.tcp_retrans_segs,
-            "uptime_seconds": uptime,   # Always exposed at top level for UI (avoid false alerts on recent boot)
-            "data": e.data,  # full probe payload for http_tests, ping details, etc.
+            "rx_power_dbm": e.rx_power_dbm,
+            "tx_power_dbm": e.tx_power_dbm,
+            "optical_status": e.optical_status,
+            "uptime_seconds": uptime,
+            "data": e.data,
         })
     return out
 

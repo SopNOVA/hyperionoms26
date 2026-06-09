@@ -25,6 +25,11 @@ class TelemetryEvent(Base):
     # Datos completos del agente (flexible)
     data = Column(JSON, nullable=False)
 
+    # Señal óptica GPON (desde CLI oculto del firmware: laser power --rxread / --txread)
+    rx_power_dbm = Column(Float, nullable=True)   # potencia recibida en dBm
+    tx_power_dbm = Column(Float, nullable=True)   # potencia transmitida en dBm
+    optical_status = Column(String(20), nullable=True)  # GOOD / WARNING / CRITICAL / UNKNOWN
+
     # Tipo de entrega
     delivery = Column(String(20), default="live")  # live, diagnostic, etc.
 
