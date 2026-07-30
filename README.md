@@ -204,5 +204,3 @@ El proyecto es 100% funcional: matching, ingest con clasificación especial, sen
 
 ---
 
-¡Proyecto renombrado y mejorado a Hyperion-ONMS! Todo revisado para que funcione correctamente (sintaxis, lógica, Windows, tests actualizados).
-
